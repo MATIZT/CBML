@@ -1,5 +1,7 @@
 import re
 from asyncio import sleep
+from difflib import SequenceMatcher
+from os.path import splitext
 from urllib.parse import unquote
 
 from niquests import AsyncSession
@@ -25,6 +27,7 @@ _SITE_PREFIX = re.compile(
 )
 
 _poster_cache = {}
+_imdb_image_cache = {}
 
 
 def _tidy(title):
@@ -38,20 +41,26 @@ def _final_clean(title):
 
 
 def clean_poster_title(raw_title):
-    title = unquote(raw_title)
+    """Extract the actual movie/series name from a full path or release filename."""
+    raw_title = unquote(str(raw_title or "")).replace("\\", "/")
+    # The caller frequently passes an absolute file path, not just its filename.
+    title = raw_title.rsplit("/", 1)[-1]
+    stem, ext = splitext(title)
+    if ext and len(ext) <= 9:
+        title = stem
+
     title = re.sub(r"https?://\S+", " ", title)
     title = re.sub(r"\b(?:t|telegram)\.me/\S+", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\[[^\]]*\]", " ", title)
     title = re.sub(r"[\[\](){}]", " ", title)
-    title = re.sub(r"\.\w{2,4}$", "", title)
     title = _SITE_PREFIX.sub("", title)
     title = re.sub(r"\bwww\S*", " ", title, flags=re.IGNORECASE)
     title = title.replace("_", " ")
-    if _QUALITY_TAGS.search(title):
-        title = re.sub(r"-\w+$", "", title)
     title = title.replace(".", " ")
     title = re.sub(r"\s+", " ", title).strip()
 
+    # For episode releases, everything after SxxExxx is release noise. Keep
+    # the show name only (e.g. My Hero Academia Vigilantes).
     for pattern in (
         r"(?<!\w)S0*\d{1,2}\s?E\d{1,3}(?!\w)",
         r"\bSeason\s+\d{1,2}\b",
@@ -72,6 +81,20 @@ def clean_poster_title(raw_title):
         tail = title[last.end() :].strip()
         return _final_clean(head if len(head) > 1 else tail), last.group(0)
 
+    # If there is no year/episode marker, stop at the first technical release
+    # token so encodes, languages, codecs, and uploader decorations are not
+    # mistakenly sent to IMDb as part of the title.
+    technical = re.search(
+        r"\b(?:\d{3,4}p|4k|2160p|1080p|720p|480p|WEB[\s._-]*DL|WEB[\s._-]*RIP|"
+        r"BLU[\s._-]*RAY|BD[\s._-]*RIP|BR[\s._-]*RIP|HDTV|HEVC|H[.]?26[45]|"
+        r"X26[45]|XVID|DIVX|AAC(?:[\s._-]*\d(?:[.]\d)?)*|AC3|EAC3|DTS|TRUEHD|"
+        r"ESUBS?|MSUBS?|SUBBED|DUBBED)\b",
+        title,
+        re.IGNORECASE,
+    )
+    if technical and technical.start() > 1:
+        title = title[: technical.start()].strip()
+    title = re.sub(r"[~|]+.*$", " ", title).strip()
     return _final_clean(title), None
 
 
@@ -176,25 +199,142 @@ async def get_tmdb_poster_link(title, year=None, as_doc=False):
     return None
 
 
+def _normalize_title(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+async def get_imdb_thumbnail_link(title, year=None, as_doc=False):
+    """Find a title on IMDb and select a poster (documents) or a landscape still (video)."""
+    from .bot_utils import sync_to_async
+
+    cache_key = (title.casefold(), str(year or ""), bool(as_doc))
+    if cache_key in _imdb_image_cache:
+        return _imdb_image_cache[cache_key]
+
+    try:
+        from imdbio import get_media_gallery, get_movie, search_title
+
+        search_year = int(year) if str(year or "").isdigit() else None
+        search_result = await sync_to_async(
+            search_title, title, year=search_year, locale="en"
+        )
+        candidates = list(getattr(search_result, "titles", None) or [])
+        if not candidates:
+            _imdb_image_cache[cache_key] = None
+            return None
+
+        target = _normalize_title(title)
+
+        def candidate_score(candidate):
+            candidate_title = getattr(candidate, "title", "")
+            normalized = _normalize_title(candidate_title)
+            similarity = SequenceMatcher(None, target, normalized).ratio()
+            kind = str(getattr(candidate, "kind", "") or "").casefold()
+            # A series release filename is cleaned to its show name, so prefer
+            # the series title over a similarly named episode or movie.
+            if "series" in kind or "miniseries" in kind:
+                similarity += 0.08
+            elif "episode" in kind:
+                similarity -= 0.08
+            if search_year and str(getattr(candidate, "year", "")) == str(search_year):
+                similarity += 0.04
+            return similarity
+
+        candidates.sort(key=candidate_score, reverse=True)
+        for candidate in candidates[:4]:
+            imdb_id = (
+                getattr(candidate, "imdbId", None)
+                or getattr(candidate, "imdb_id", None)
+                or getattr(candidate, "id", None)
+            )
+            if not imdb_id:
+                continue
+
+            cover_url = getattr(candidate, "cover_url", None)
+            # IMDb's title cover is the portrait poster, ideal for document mode.
+            if as_doc and cover_url:
+                _imdb_image_cache[cache_key] = cover_url
+                return cover_url
+
+            gallery = await sync_to_async(get_media_gallery, str(imdb_id), locale="en")
+            items = list(getattr(gallery, "items", None) or [])
+
+            def image_shape(item):
+                width = getattr(item, "width", None) or 0
+                height = getattr(item, "height", None) or 0
+                try:
+                    width, height = int(width), int(height)
+                except (TypeError, ValueError):
+                    width, height = 0, 0
+                image_type = str(getattr(item, "type", "") or "").casefold()
+                return width, height, image_type
+
+            if as_doc:
+                # Prefer genuine portrait posters from the gallery.
+                for item in items:
+                    width, height, image_type = image_shape(item)
+                    if getattr(item, "url", None) and (
+                        (width > 0 and height > 0 and height > width)
+                        or "poster" in image_type
+                        or "portrait" in image_type
+                    ):
+                        _imdb_image_cache[cache_key] = item.url
+                        return item.url
+                if cover_url:
+                    _imdb_image_cache[cache_key] = cover_url
+                    return cover_url
+            else:
+                # Media output is video, so use the first landscape still/backdrop.
+                for item in items:
+                    width, height, image_type = image_shape(item)
+                    is_landscape = width > height > 0
+                    is_wide_type = any(
+                        tag in image_type
+                        for tag in ("backdrop", "landscape", "still", "frame")
+                    )
+                    if getattr(item, "url", None) and (is_landscape or is_wide_type):
+                        _imdb_image_cache[cache_key] = item.url
+                        return item.url
+
+            # Try detail data only as a poster fallback; never substitute a
+            # portrait as a video backdrop here.
+            if as_doc:
+                detail = await sync_to_async(get_movie, str(imdb_id), locale="en")
+                detail_cover = getattr(detail, "cover_url", None) if detail else None
+                if detail_cover:
+                    _imdb_image_cache[cache_key] = detail_cover
+                    return detail_cover
+
+        _imdb_image_cache[cache_key] = None
+        return None
+    except Exception as exc:
+        # IMDb can be temporarily rate-limited/WAF-blocked; TMDb or local-frame
+        # fallback remains available, so thumbnail creation should never fail.
+        LOGGER.debug("IMDb auto-thumbnail lookup failed for '%s': %s", title, exc)
+        return None
+
+
 async def get_auto_thumbnail(filename, as_doc=False):
     from .media_utils import download_image_thumb
-
-    if not _tmdb_token():
-        return None
 
     title, year = clean_poster_title(filename)
     if len(title) < 2:
         return None
 
-    key = (title, year, as_doc)
+    key = (title, year, bool(as_doc))
     poster_url = _poster_cache.get(key)
     if not poster_url:
-        poster_url = await get_tmdb_poster_link(title, year, as_doc)
+        # IMDb is the primary no-token source. The full release filename is
+        # cleaned above, e.g. "My Hero Academia Vigilantes S01E12 ..." becomes
+        # only "My Hero Academia Vigilantes" before search.
+        poster_url = await get_imdb_thumbnail_link(title, year, as_doc)
+        if not poster_url:
+            poster_url = await get_tmdb_poster_link(title, year, as_doc)
         if not poster_url:
             return None
         if len(_poster_cache) > 200:
             _poster_cache.clear()
         _poster_cache[key] = poster_url
 
-    LOGGER.info(f"Auto thumbnail for '{title}': {poster_url}")
+    LOGGER.info("Auto thumbnail selected for '%s' (mode=%s)", title, "portrait" if as_doc else "landscape")
     return await download_image_thumb(poster_url) or None

@@ -22,13 +22,7 @@ from ..helper.ext_utils.status_utils import get_readable_file_size, get_readable
 from ..helper.listeners.task_listener import TaskListener
 from ..helper.mirror_leech_utils.download_utils.yt_dlp_download import (
     YoutubeDLHelper,
-    YT_EXTRACTOR_ARGS,
-    YT_JS_OPTS,
     get_cookie_file,
-    get_social_cookie_file,
-    get_yt_js_options,
-    is_youtube_link,
-    probe_youtube,
 )
 from ..helper.telegram_helper.button_build import ButtonMaker
 from ..helper.telegram_helper.message_utils import (
@@ -291,7 +285,6 @@ class YtDlp(TaskListener):
         super().__init__()
         self.is_ytdlp = True
         self.is_leech = is_leech
-        self.is_social = bool(kwargs.get('is_social', False))
 
     async def new_event(self):
         text = self.message.text.split("\n")
@@ -363,14 +356,13 @@ class YtDlp(TaskListener):
             self.ffmpeg_cmds = None
             LOGGER.error(e)
 
-        opt = args["-opt"]
-        if opt and isinstance(opt, str):
-            opt = opt.strip()
-            if opt.startswith("{") and opt.endswith("}"):
-                try:
-                    opt = literal_eval(opt)
-                except Exception as e:
-                    LOGGER.error(e)
+        try:
+            opt = literal_eval(args["-opt"]) if args["-opt"] else {}
+            if not isinstance(opt, dict):
+                raise ValueError("yt-dlp options must be a dict")
+        except Exception as e:
+            LOGGER.error(e)
+            opt = {}
 
         self.select = args["-s"]
         self.name = args["-n"]
@@ -485,69 +477,26 @@ class YtDlp(TaskListener):
 
         self._set_mode_engine()
 
-        cookie_to_use = (
-            get_social_cookie_file(self.user_id, self.link, self.user_dict)
-            if self.is_social
-            else get_cookie_file(self.user_dict)
-        )
+        cookie_to_use = get_cookie_file(self.user_dict)
         LOGGER.info(
-            f"Using {'social' if self.is_social else 'YouTube'} cookies file: "
-            f"{cookie_to_use} | User ID : {self.user_id}"
+            f"Using cookies.txt file: {cookie_to_use} | User ID : {self.user_id}"
         )
 
-        options = {
-            "usenetrc": True,
-            "cookiefile": cookie_to_use,
-            "extractor_args": YT_EXTRACTOR_ARGS,
-            **get_yt_js_options(),
-        }
+        options = {"usenetrc": True, "cookiefile": cookie_to_use}
         if opt:
-            if isinstance(opt, str):
-                yt_opt = opt.split("|")
-                for ytopt in yt_opt:
-                    if ":" not in ytopt:
+            for key, value in opt.items():
+                if key in ["postprocessors", "download_ranges"]:
+                    continue
+                if key == "format" and not self.select:
+                    if value.startswith("ba/b-"):
+                        qual = value
                         continue
-                    key, value = map(str.strip, ytopt.split(":", 1))
-                    if key == "format" and not self.select:
-                        if value.startswith("ba/b-"):
-                            qual = value
-                            continue
-                        else:
-                            qual = value
-                    if value.startswith("^"):
-                        if "." in value or value == "^inf":
-                            value = float(value.split("^", 1)[1])
-                        else:
-                            value = int(value.split("^", 1)[1])
-                    elif value.lower() == "true":
-                        value = True
-                    elif value.lower() == "false":
-                        value = False
-                    elif value.startswith(("{", "[", "(")) and value.endswith(("}", "]", ")")):
-                        try:
-                            value = literal_eval(value)
-                        except Exception:
-                            pass
-                    options[key] = value
-            elif isinstance(opt, dict):
-                for key, value in opt.items():
-                    if key in ["postprocessors", "download_ranges"]:
-                        continue
-                    if key == "format" and not self.select:
-                        if value.startswith("ba/b-"):
-                            qual = value
-                            continue
-                        else:
-                            qual = value
-                    options[key] = value
+                    else:
+                        qual = value
+                options[key] = value
         options["playlist_items"] = "0"
         try:
-            if is_youtube_link(self.link):
-                result, self.yt_cfg, _ = await sync_to_async(
-                    probe_youtube, self.link, options
-                )
-            else:
-                result = await sync_to_async(extract_info, self.link, options)
+            result = await sync_to_async(extract_info, self.link, options)
         except Exception as e:
             msg = str(e).replace("<", " ").replace(">", " ")
             await send_message(self.message, f"{self.tag} {msg}")
@@ -583,26 +532,3 @@ async def ytdl_leech(client, message):
         await message.reply("YT-DLP downloads are currently disabled by the Bot Owner.")
         return
     bot_loop.create_task(YtDlp(client, message, is_leech=True).new_event())
-
-
-async def socialdl(client, message):
-    if Config.DISABLE_YTDLP:
-        await message.reply("YT-DLP downloads are currently disabled by the Bot Owner.")
-        return
-    if not message.from_user:
-        await message.reply("❌ Social cookie/download commands require a user account.")
-        return
-    bot_loop.create_task(YtDlp(client, message, is_social=True).new_event())
-
-
-async def socialdl_leech(client, message):
-    if Config.DISABLE_YTDLP:
-        await message.reply("YT-DLP downloads are currently disabled by the Bot Owner.")
-        return
-    if not message.from_user:
-        await message.reply("❌ Social cookie/download commands require a user account.")
-        return
-    # /sdt is the Telegram-upload variant of /sdl. It intentionally reuses
-    # the exact same YtDlp argument parser, quality selector, cookie lookup,
-    # FFmpeg pipeline, task manager, and Telegram upload/dump logic.
-    bot_loop.create_task(YtDlp(client, message, is_social=True, is_leech=True).new_event())

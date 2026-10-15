@@ -54,7 +54,7 @@ class EngineStatus:
         self.STATUS_AIOHTTP = f"AioHttp v{get_v('aiohttp', '3.14.3')}"
         self.STATUS_GDAPI = f"Google-API v{get_v('gapi', '2.201.0')}"
         self.STATUS_QBIT = f"qBit v{get_v('qBittorrent', '5.2.3')}"
-        self.STATUS_TGRAM = f"wzgram v{get_v('wzgram', '3.1.3')}"
+        self.STATUS_TGRAM = f"wzgram v{get_v('wzgram', '3.1.5')}"
         self.STATUS_MEGA = f"MegaSDK v{get_v('mega', '10.20.20')}"
         self.STATUS_YTDLP = f"yt-dlp v{get_v('yt-dlp', '2026.08.19')}"
         self.STATUS_FFMPEG = f"ffmpeg v{get_v('ffmpeg', '9.0.2')}"
@@ -205,20 +205,53 @@ def speed_string_to_bytes(size_text: str):
     return size
 
 
-def bar_wave(pct, width=10):
+BAR_LENGTH = 10
+UPDATE_INTERVAL = 2.0
+
+
+def _progress_percent(percent) -> float:
+    """Normalize status values such as 63, 63.2, or the string '63.2%'."""
     try:
-        p = float(str(pct).strip("%"))
-    except Exception:
-        p = 0.0
-    p = min(max(p, 0), 100)
-    heights = "▁▂▃▄▅▆▇█"
-    n = int(p / 100 * width)
-    bar = "".join(heights[min(7, int((i+1)/width*8))] if i < n else "▁" for i in range(width))
-    return f"┃{bar}┃ {p:.2f}%"
+        value = float(str(percent).strip().removesuffix("%"))
+    except (TypeError, ValueError):
+        value = 0.0
+    # NaN does not compare normally; force every malformed value to a safe range.
+    if value != value:
+        value = 0.0
+    return max(0.0, min(100.0, value))
+
+
+def progress_bar(percent: float) -> str:
+    """Render exactly ten Unicode blocks in the requested Telegram style."""
+    value = _progress_percent(percent)
+    filled = min(BAR_LENGTH, int(value // (100 / BAR_LENGTH)))
+    return ("▰" * filled) + ("▱" * (BAR_LENGTH - filled))
+
+
+def format_progress(
+    title: str,
+    percent: float,
+    speed: str = "Calculating...",
+    filename: str = "Unknown",
+) -> str:
+    percent = _progress_percent(percent)
+    return (
+        f"<b>✨ {escape(str(title))}</b>\n"
+        f"<blockquote>📊 <b>Progress:</b> <code>{progress_bar(percent)}</code> "
+        f"<b>{percent:.1f}%</b>\n"
+        f"⚡ <b>Speed:</b> {escape(str(speed))}\n"
+        f"📄 <b>File:</b> <code>{escape(str(filename))}</code></blockquote>"
+    )
+
+
+def bar_wave(pct, width=BAR_LENGTH):
+    """Backward-compatible alias used by older modules."""
+    return progress_bar(pct)
 
 
 def get_progress_bar_string(pct):
-    return bar_wave(pct)
+    # Called directly by older consumers; retain it as a public compatibility API.
+    return progress_bar(pct)
 
 
 async def get_readable_message(sid, is_user, page_no=1, status="All", page_step=1):
@@ -227,20 +260,42 @@ async def get_readable_message(sid, is_user, page_no=1, status="All", page_step=
 
     tasks = await get_specific_tasks(status, sid if is_user else None)
 
-    STATUS_LIMIT = Config.STATUS_LIMIT
+    STATUS_LIMIT = max(1, int(Config.STATUS_LIMIT or 1))
     tasks_no = len(tasks)
-    pages = (max(tasks_no, 1) + STATUS_LIMIT - 1) // STATUS_LIMIT
+
+    # Telegram messages have a hard text limit. Build variable-size pages using
+    # a conservative estimate per task, while preserving the configured task cap.
+    page_groups = []
+    current_group = []
+    estimated_chars = 0
+    for task_index, task in enumerate(tasks):
+        try:
+            task_name = str(task.name())
+        except Exception:
+            task_name = "Unknown task"
+        estimate = 900 + min(len(task_name), 700) * 2
+        if current_group and (
+            len(current_group) >= STATUS_LIMIT
+            or estimated_chars + estimate > 3000
+        ):
+            page_groups.append(current_group)
+            current_group = []
+            estimated_chars = 0
+        current_group.append((task_index, task))
+        estimated_chars += estimate
+    if current_group:
+        page_groups.append(current_group)
+
+    pages = max(1, len(page_groups))
     if page_no > pages:
-        page_no = (page_no - 1) % pages + 1
+        page_no = pages
         status_dict[sid]["page_no"] = page_no
     elif page_no < 1:
-        page_no = pages - (abs(page_no) % pages)
+        page_no = 1
         status_dict[sid]["page_no"] = page_no
-    start_position = (page_no - 1) * STATUS_LIMIT
+    selected_tasks = page_groups[page_no - 1] if page_groups else []
 
-    for index, task in enumerate(
-        tasks[start_position : STATUS_LIMIT + start_position], start=1
-    ):
+    for index, task in selected_tasks:
         if status != "All":
             tstatus = status
         elif iscoroutinefunction(task.status):
@@ -248,9 +303,9 @@ async def get_readable_message(sid, is_user, page_no=1, status="All", page_step=
         else:
             tstatus = task.status()
 
-        msg += f"📦 <b>{index + start_position}. {escape(f'{task.name()}')}</b>\n"
+        msg += f"📦 <b>{index + 1}. {escape(f'{task.name()}')}</b>\n"
         if task.listener.subname:
-            msg += f"┖ <b>Sub Name:</b> {task.listener.subname}\n"
+            msg += f"┖ <b>Sub Name:</b> {escape(str(task.listener.subname))}\n"
         elapsed = time() - task.listener.message.date.timestamp()
 
         msg += f"👤 <b>User:</b> {task.listener.message.from_user.mention(style='html')} (<code>#ID{task.listener.message.from_user.id}</code>)"
@@ -264,7 +319,13 @@ async def get_readable_message(sid, is_user, page_no=1, status="All", page_step=
             and task.listener.progress
         ):
             progress = task.progress()
-            task_details += f"┟ {get_progress_bar_string(progress)}\n"
+            progress_value = _progress_percent(progress)
+            progress_label = f"{progress_value:.1f}%"
+            # Render the requested glyphs directly in the live /status path.
+            task_details += (
+                f"📊 <b>Progress:</b> <code>{progress_bar(progress_value)}</code> "
+                f"<b>{progress_label}</b>\n"
+            )
             if task.listener.subname:
                 subsize = f" / {get_readable_file_size(task.listener.subsize)}"
                 ac = len(task.listener.files_to_proceed)
@@ -294,8 +355,12 @@ async def get_readable_message(sid, is_user, page_no=1, status="All", page_step=
         else:
             task_details += f"┠ <b>Size:</b> {task.size()}\n"
 
-        task_details += f"┠ <b>Engine:</b> {task.engine}\n"
-        task_details += f"┠ <b>Mode:</b> {task.listener.mode[0]} ➔ {task.listener.mode[1]}\n"
+        task_details += f"┠ <b>Engine:</b> {escape(str(task.engine))}\n"
+        mode_from, mode_to = task.listener.mode
+        task_details += (
+            f"┠ <b>Mode:</b> {escape(str(mode_from))} ➔ "
+            f"{escape(str(mode_to))}\n"
+        )
 
         from ..telegram_helper.bot_commands import BotCommands
 
@@ -329,7 +394,7 @@ async def get_readable_message(sid, is_user, page_no=1, status="All", page_step=
             position="header",
             style=ButtonStyle.PRIMARY,
         )
-    if len(tasks) > STATUS_LIMIT:
+    if pages > 1:
         msg += f"<b>Page:</b> {page_no}/{pages} | <b>Tasks:</b> {tasks_no} | <b>Step:</b> {page_step}\n"
         buttons.data_button("<<", f"status {sid} pre", position="header")
         buttons.data_button(">>", f"status {sid} nex", position="header")

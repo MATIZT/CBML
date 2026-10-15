@@ -1,6 +1,7 @@
 from re import match as re_match
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote, unquote_plus
+from pyrogram.types import Message
 
 
 def is_magnet(url: str):
@@ -125,3 +126,25 @@ def decode_slink(b64_str):
     return urlsafe_b64decode(
         (b64_str.strip("=") + "=" * (-len(b64_str.strip("=")) % 4)).encode("ascii")
     ).decode("ascii")
+
+
+def is_media(message: Message):
+    """Return the first supported Telegram media object, or None."""
+    if not message:
+        return None
+    return (
+        message.document
+        or message.photo
+        or message.video
+        or message.audio
+        or message.voice
+        or message.video_note
+        or message.sticker
+        or message.animation
+        or None
+    )
+
+
+def get_url_name(url: str):
+    """Return a decoded filename-like component from a URL or path."""
+    return unquote_plus(unquote(urlparse(str(url)).path.rpartition("/")[-1]))

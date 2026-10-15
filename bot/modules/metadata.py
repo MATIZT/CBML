@@ -91,6 +91,13 @@ async def apply_metadata_title(
                     return dl_path
                 continue
 
+            # A generic METADATA/SET_ALL title belongs on the video stream only.
+            # This also prevents a global title URL from leaking into audio-track
+            # titles or language placeholders such as {languagesr}.
+            self.metadata_processor.route_global_title_to_video(
+                meta.get("global", {}), meta.get("video", {}), streams
+            )
+
             met_cmd = [
                 BinConfig.FFMPEG_NAME,
                 "-hide_banner",
@@ -118,8 +125,12 @@ async def apply_metadata_title(
                             f"-metadata:s:v:{v}",
                             f"language={lang_val}",
                         ]
-                    for k, v_ in meta["video"].items():
-                        meta_maps += [f"-metadata:s:v:{v}", f"{k}={v_}"]
+                    is_attached_picture = bool(
+                        (stream.get("disposition") or {}).get("attached_pic", 0)
+                    )
+                    if not is_attached_picture:
+                        for k, v_ in meta["video"].items():
+                            meta_maps += [f"-metadata:s:v:{v}", f"{k}={v_}"]
                     v += 1
                 elif typ == "audio":
                     maps += [f"-c:a:{a}", "copy"]

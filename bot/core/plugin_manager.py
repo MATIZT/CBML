@@ -17,6 +17,11 @@ from ..helper.telegram_helper.filters import CustomFilters
 from .config_manager import Config
 
 PKG = "wzplugins"
+# Plugin handlers must run in a separate later dispatcher group. The core bot
+# has broad message handlers (including auto_task_handler) in group 0; Pyrogram
+# stops at the first matching handler within a group, which otherwise swallowed
+# plugin commands such as /imdb, /mediainfo and /mi.
+PLUGIN_HANDLER_GROUP = 100
 MANIFEST_NAMES = ("wzml_plugin.yml", "wzml_plugin.yaml", "plugin.yml", "plugin.yaml")
 NAME_RE = r"^[a-z][a-z0-9_]{1,31}$"
 ACCESS = {
@@ -462,15 +467,26 @@ class PluginManager:
         return getattr(CustomFilters, ACCESS.get(access, "authorized"))
 
     def _suffixed(self, names):
-        suffix = Config.CMD_SUFFIX or ""
-        return [
-            (
-                item
-                if item in ["start", "restartall", "statusall"]
-                else f"{item}{suffix}"
-            )
-            for item in names
-        ]
+        """Return base command names and CMD_SUFFIX variants.
+
+        Keep the original command usable for compatibility while also registering
+        the configured suffixed spelling (for example /imdb and /imdbh).
+        """
+        suffix = str(Config.CMD_SUFFIX or "").strip()
+        result = []
+        for raw_name in names:
+            item = str(raw_name).strip().lstrip("/")
+            if not item:
+                continue
+            candidates = [item]
+            if suffix and item not in ["start", "restartall", "statusall"]:
+                # Avoid double suffixes if a manifest already includes it.
+                if not item.endswith(suffix):
+                    candidates.append(f"{item}{suffix}")
+            for candidate in candidates:
+                if candidate not in result:
+                    result.append(candidate)
+        return result
 
     def _build_handlers(self, rec):
         built = []
@@ -490,7 +506,7 @@ class PluginManager:
                         )
                         & self._filter_for(cmd.access),
                     ),
-                    0,
+                    PLUGIN_HANDLER_GROUP,
                 )
             )
         for cb in rec.manifest.callbacks:
@@ -505,7 +521,7 @@ class PluginManager:
                         func,
                         filters=regex(cb.pattern) & self._filter_for(cb.access),
                     ),
-                    0,
+                    PLUGIN_HANDLER_GROUP,
                 )
             )
         return built
@@ -518,10 +534,18 @@ class PluginManager:
             LOGGER.error(f"Plugin {rec.name}: {rec.error}")
             return False
         handlers = self._build_handlers(rec)
+        if (rec.manifest.commands or rec.manifest.callbacks) and not handlers:
+            rec.error = "manifest declares handlers, but none could be registered"
+            LOGGER.error(f"Plugin {rec.name}: {rec.error}")
+            return False
         for handler, group in handlers:
             self.bot.add_handler(handler, group)
         rec.handlers = handlers
         rec.registered = True
+        LOGGER.info(
+            f"Plugin {rec.name}: registered {len(handlers)} handler(s) in dispatcher group(s) "
+            f"{sorted({group for _, group in handlers})}"
+        )
         return True
 
     def _detach(self, rec):
@@ -891,6 +915,24 @@ class PluginManager:
                     if state is None:
                         await self._store(name, enabled=True, source="bundled")
                         state = self.states[name]
+
+                    # These core user-facing commands must remain available after
+                    # deployment even if an old MongoDB plugin state disabled them.
+                    # Older releases could persist enabled=False/autoload=False,
+                    # making the plugin appear in the loaded count but registering
+                    # no command handlers (the exact symptom: commands get no reply).
+                    if name in {"imdb", "mediainfo"}:
+                        changed = state.get("enabled") is False or state.get("autoload") is False
+                        state = dict(state)
+                        state["enabled"] = True
+                        state["autoload"] = True
+                        self.states[name] = state
+                        if changed:
+                            await self._store(name, enabled=True, autoload=True)
+                            LOGGER.warning(
+                                f"Plugin {name}: forced enabled/autoload on startup so its commands register"
+                            )
+
                     if not state.get("autoload", True):
                         continue
                     ok, err = await self._do_load(
@@ -916,6 +958,31 @@ class PluginManager:
                 if idle:
                     line += f" | Skipped: {', '.join(sorted(idle))}"
                 LOGGER.info(line)
+            # Always print exact boot-time failure reasons. Previously a plugin
+            # could fail to import/register and only affect the loaded count,
+            # leaving no actionable clue in deploy.vps journal output.
+            for failed_name, reason in sorted(self.errors.items()):
+                LOGGER.error(f"Plugin {failed_name}: startup load failed: {reason}")
+            for required_name in ("imdb", "mediainfo"):
+                rec = self.records.get(required_name)
+                if rec is None:
+                    LOGGER.error(
+                        f"Required plugin {required_name} is NOT loaded; see the startup load failure above"
+                    )
+                elif not rec.registered or not rec.handlers:
+                    LOGGER.error(
+                        f"Required plugin {required_name} loaded without registered command handlers"
+                    )
+                elif any(group != PLUGIN_HANDLER_GROUP for _, group in rec.handlers):
+                    LOGGER.error(
+                        f"Required plugin {required_name}: handler group mismatch; expected "
+                        f"{PLUGIN_HANDLER_GROUP}, got {sorted({group for _, group in rec.handlers})}"
+                    )
+                else:
+                    LOGGER.info(
+                        f"Required plugin {required_name}: registered {len(rec.handlers)} handler(s) "
+                        f"in group {PLUGIN_HANDLER_GROUP}, enabled={rec.enabled}"
+                    )
 
 
 plugin_manager = PluginManager(None)

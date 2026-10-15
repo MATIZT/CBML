@@ -56,7 +56,10 @@ from .users_settings import (
     edit_user_settings,
     send_user_settings,
 )
-from .ytdlp import ytdl, ytdl_leech, socialdl, socialdl_leech
+from .ytdlp import ytdl, ytdl_leech
+# VT legacy command aliases now use the exact WZML-X yt-dlp handlers.
+socialdl = ytdl
+socialdl_leech = ytdl_leech
 from .social_cookies import cookiesettings, social_cookie_callback
 from .addbot import add_bot_command, add_bot_cb
 from .request_ff import request_ff, reqff_callback

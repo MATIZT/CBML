@@ -15,6 +15,8 @@ from .tg_client import TgClient
 
 
 async def add_handlers():
+    from ..modules.api_manager import register_api_handlers
+    register_api_handlers(TgClient.bot)
     TgClient.bot.add_handler(
         MessageHandler(
             authorize,

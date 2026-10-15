@@ -72,7 +72,7 @@ async def gen_mediainfo(message, link=None, media=None, mmsg=None):
     try:
         from datetime import datetime
         import random
-        title = f"MediaInfo-X-{datetime.now().strftime("%d-%m")}-{random.randint(10000, 99999)}"
+        title = f"MediaInfo-X-{datetime.now().strftime('%d-%m')}-{random.randint(10000, 99999)}"
         page = await telegraph.create_page(title=title, content=tc)
         path = page.get("path", "") if isinstance(page, dict) else ""
         if path:
@@ -89,7 +89,7 @@ async def gen_mediainfo(message, link=None, media=None, mmsg=None):
                     json={
                         "content": tc,
                         "title": f"MediaInfo · {ospath.basename(des_path or 'media')}",
-                        "author": "HTR-X",
+                        "author": "cantarellabots",
                         "expiry": "never",
                     },
                     timeout=ClientTimeout(total=30),

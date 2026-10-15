@@ -14,7 +14,7 @@ from asyncio import (
 )
 from asyncio.subprocess import PIPE
 from os import path as ospath
-from re import search as re_search, escape
+from re import search as re_search, escape, findall as re_findall, split as re_split
 from time import time
 from aioshutil import move, rmtree
 from langcodes import Language
@@ -24,7 +24,7 @@ from ... import LOGGER, DOWNLOAD_DIR
 from ...core.cpu import ffmpeg_layout
 from ...core.config_manager import Config, BinConfig
 from .bot_utils import cmd_exec, sync_to_async
-from .files_utils import get_mime_type, is_archive, is_archive_split
+from .files_utils import get_mime_type, is_archive, is_archive_split, get_path_size
 from .status_utils import time_to_seconds
 
 
@@ -170,6 +170,57 @@ async def download_image_thumb(url):
     return output
 
 
+_LANGUAGE_ALIASES = {
+    "telugu": "te", "tel": "te", "tamil": "ta", "tam": "ta",
+    "hindi": "hi", "hin": "hi", "english": "en", "eng": "en",
+    "kannada": "kn", "kan": "kn", "malayalam": "ml", "mal": "ml",
+    "japanese": "ja", "jpn": "ja", "korean": "ko", "kor": "ko",
+    "spanish": "es", "spa": "es", "french": "fr", "fra": "fr", "fre": "fr",
+    "german": "de", "deu": "de", "ger": "de", "arabic": "ar", "ara": "ar",
+    "russian": "ru", "rus": "ru", "italian": "it", "ita": "it",
+    "chinese": "zh", "mandarin": "zh", "zho": "zh", "chi": "zh",
+    "bengali": "bn", "bangla": "bn", "marathi": "mr", "punjabi": "pa",
+    "urdu": "ur", "portuguese": "pt", "thai": "th", "indonesian": "id",
+    "vietnamese": "vi", "turkish": "tr", "dutch": "nl", "nepali": "ne",
+    "persian": "fa", "hebrew": "he", "polish": "pl", "swedish": "sv",
+}
+
+
+def normalize_language_tag(code):
+    """Clean language tags, discarding accidentally appended metadata fields."""
+    value = str(code or "").strip()
+    if not value or re.match(r"^(?:title|artist|album|codec|bitrate)\s*=", value, re.I):
+        return ""
+    value = re.sub(r"\s+(?:title|artist|album|codec|bitrate)\s*=.*$", "", value, flags=re.I).strip()
+    if "|" in value:
+        value = value.split("|", 1)[0].strip()
+    if "=" in value:
+        value = value.split("=", 1)[0].strip()
+    key = value.casefold()
+    value = _LANGUAGE_ALIASES.get(key, value)
+    if value.casefold() in {"und", "unknown", "undefined", "none", "zxx", "n/a"}:
+        return ""
+    return value
+
+
+def get_language_names(code):
+    """Return (display language, native language), or (None, None) if invalid."""
+    value = normalize_language_tag(code)
+    if not value:
+        return None, None
+    try:
+        language = Language.get(value.replace("_", "-"))
+        display = language.display_name()
+        native = language.autonym()
+        if not display or display.casefold() == value.casefold():
+            return None, None
+        if not native or native.casefold() == value.casefold():
+            native = display
+        return display, native
+    except Exception:
+        return None, None
+
+
 async def get_media_info(path, extra_info=False):
     try:
         result = await cmd_exec(
@@ -199,34 +250,41 @@ async def get_media_info(path, extra_info=False):
             return (0, "", "", "", "") if extra_info else (0, None, None)
         duration = round(float(fields.get("duration", 0)))
         if extra_info:
-            lang, langr, qual, stitles = "", "", "", ""
-            if (streams := ffresult.get("streams")) and streams[0].get(
-                "codec_type"
-            ) == "video":
-                qual = int(streams[0].get("height"))
-                qual = f"{480 if qual <= 480 else 540 if qual <= 540 else 720 if qual <= 720 else 1080 if qual <= 1080 else 2160 if qual <= 2160 else 4320 if qual <= 4320 else 8640}p"
-                for stream in streams:
-                    if stream.get("codec_type") == "audio" and (
-                        lc := stream.get("tags", {}).get("language")
-                    ):
-                        d_name = lc
-                        native_name = lc
-                        with suppress(Exception):
-                            l_obj = Language.get(lc)
-                            d_name = l_obj.display_name()
-                            native_name = l_obj.autonym()
-                        if d_name not in lang:
-                            lang += f"{d_name}, "
-                        if native_name not in langr:
-                            langr += f"{native_name}, "
-                    if stream.get("codec_type") == "subtitle" and (
-                        st := stream.get("tags", {}).get("language")
-                    ):
-                        with suppress(Exception):
-                            st = Language.get(st).display_name()
-                        if st not in stitles:
-                            stitles += f"{st}, "
-            return duration, qual, lang[:-2], stitles[:-2], langr[:-2]
+            lang_names, lang_native, subtitle_names = [], [], []
+            streams = ffresult.get("streams") or []
+
+            def _language_names(code):
+                return get_language_names(code)
+
+            video_stream = next(
+                (stream for stream in streams if stream.get("codec_type") == "video"),
+                None,
+            )
+            qual = ""
+            if video_stream:
+                try:
+                    height = int(video_stream.get("height") or 0)
+                    if height > 0:
+                        qual = f"{480 if height <= 480 else 540 if height <= 540 else 720 if height <= 720 else 1080 if height <= 1080 else 2160 if height <= 2160 else 4320 if height <= 4320 else 8640}p"
+                except (TypeError, ValueError):
+                    qual = ""
+
+            for stream in streams:
+                codec_type = stream.get("codec_type")
+                stream_tags = stream.get("tags") or {}
+                code = stream_tags.get("language") or stream_tags.get("LANGUAGE")
+                if codec_type not in {"audio", "subtitle"}:
+                    continue
+                display, native = _language_names(code)
+                if codec_type == "audio" and display:
+                    if display not in lang_names:
+                        lang_names.append(display)
+                    if native and native not in lang_native:
+                        lang_native.append(native)
+                elif codec_type == "subtitle" and display and display not in subtitle_names:
+                    subtitle_names.append(display)
+
+            return duration, qual, ", ".join(lang_names), ", ".join(subtitle_names), ", ".join(lang_native)
         tags = fields.get("tags", {})
         artist = tags.get("artist") or tags.get("ARTIST") or tags.get("Artist")
         title = tags.get("title") or tags.get("TITLE") or tags.get("Title")
@@ -1546,3 +1604,118 @@ async def apply_thumbnail_watermark(thumb_path: str, user_dict: dict) -> str:
     except Exception as e:
         LOGGER.warning(f"Error applying thumbnail watermark: {e}")
         return thumb_path
+
+
+class FFProgress:
+    """Progress reader for Video Tools ffmpeg commands that report on stderr."""
+    def __init__(self):
+        self.is_cancel = False
+        self._duration = 0
+        self._start_time = time()
+        self._eta = 0
+        self._percentage = "0%"
+        self._processed_bytes = 0
+        self._input_size = 0
+
+    @property
+    def processed_bytes(self):
+        return self._processed_bytes
+
+    @property
+    def percentage(self):
+        return self._percentage
+
+    @property
+    def eta(self):
+        return self._eta
+
+    @property
+    def speed(self):
+        elapsed = max(time() - self._start_time, 0.001)
+        return self._processed_bytes / elapsed
+
+    # Aliases consumed by this branch's FFMpegStatus implementation.
+    @property
+    def speed_raw(self):
+        return self.speed
+
+    @property
+    def progress_raw(self):
+        try:
+            return float(str(self._percentage).rstrip("%"))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
+    def eta_raw(self):
+        return self._eta
+
+    async def readlines(self, stream):
+        data = bytearray()
+        while not stream.at_eof():
+            lines = re_split(br"[\r\n]+", data)
+            data[:] = lines.pop(-1)
+            for line in lines:
+                yield line
+            try:
+                chunk = await stream.read(1024)
+            except Exception:
+                break
+            if not chunk:
+                break
+            data.extend(chunk)
+        if data:
+            yield bytes(data)
+
+    async def progress(self, status: str = ""):
+        start_time = time()
+        stream = getattr(getattr(self.listener, "subproc", None), "stderr", None)
+        if stream is None:
+            return
+        async for line in self.readlines(stream):
+            proc = getattr(self.listener, "subproc", None)
+            if self.is_cancel or proc is None or proc == "cancelled" or proc.returncode is not None:
+                return
+            if status == "direct":
+                try:
+                    self._processed_bytes = await get_path_size(self.outfile)
+                except Exception:
+                    pass
+                await sleep(0.5)
+                continue
+            try:
+                progress = dict(re_findall(r"(frame|fps|size|time|bitrate|speed)\s*=\s*(\S+)", line.decode("utf-8", errors="ignore")))
+            except Exception:
+                progress = {}
+            if not progress:
+                continue
+            if not self._duration:
+                try:
+                    self._duration = (await get_media_info(self.path))[0]
+                    self._input_size = await get_path_size(self.path)
+                except Exception:
+                    self._duration = self._input_size = 0
+            time_str = progress.get("time", "0")
+            try:
+                parts = time_str.split(":")
+                if len(parts) == 3:
+                    elapsed = int(float(parts[0])) * 3600 + int(float(parts[1])) * 60 + float(parts[2])
+                elif len(parts) == 2:
+                    elapsed = int(float(parts[0])) * 60 + float(parts[1])
+                else:
+                    elapsed = float(parts[0])
+            except (TypeError, ValueError, IndexError):
+                elapsed = 0.0
+            if self._input_size > 0 and self._duration > 0:
+                ratio = max(0.0, min(elapsed / self._duration, 1.0))
+                self._processed_bytes = int(self._input_size * ratio)
+                self._percentage = f"{round(ratio * 100, 2)}%"
+            else:
+                self._processed_bytes = 0
+                self._percentage = "0%"
+            try:
+                speed = float(progress.get("speed", "1x").strip("x"))
+                if speed > 0 and self._duration > 0:
+                    self._eta = max(0, self._duration / speed - (time() - start_time))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass

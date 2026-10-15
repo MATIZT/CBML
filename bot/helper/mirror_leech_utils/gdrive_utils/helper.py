@@ -1,4 +1,5 @@
 from google.oauth2 import service_account
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from json import loads as json_loads
@@ -70,30 +71,77 @@ class GoogleDriveHelper:
             self.total_time += self.update_interval
 
     def authorize(self):
+        """Create a Drive v3 client using service-account or OAuth credentials.
+
+        Supports global token.pickle and per-user tokens/<user_id>.pickle.
+        Expired OAuth credentials are refreshed when a refresh token is present.
+        """
         credentials = None
         if self.use_sa:
-            json_files = sorted(f for f in listdir("accounts") if f.endswith(".json"))
+            accounts_dir = "accounts"
+            if not ospath.isdir(accounts_dir):
+                raise ValueError("Service-account mode is enabled, but accounts/ is missing.")
+            json_files = sorted(
+                f for f in listdir(accounts_dir) if f.lower().endswith(".json")
+            )
             self.sa_number = len(json_files)
-            if self.sa_number == 0:
+            if not json_files:
                 LOGGER.error("No service account files found in accounts/")
-                raise ValueError("No service account files found")
+                raise ValueError("No service account files found in accounts/")
             if self.service is None:
                 self.sa_index = randrange(self.sa_number)
             elif self.sa_index >= self.sa_number:
                 self.sa_index = 0
-            LOGGER.info(f"Authorizing with {json_files[self.sa_index]} service account")
+            account_path = ospath.join(accounts_dir, json_files[self.sa_index])
+            LOGGER.info("Authorizing with service account %s", json_files[self.sa_index])
             credentials = service_account.Credentials.from_service_account_file(
-                f"accounts/{json_files[self.sa_index]}", scopes=self._OAUTH_SCOPE
+                account_path, scopes=self._OAUTH_SCOPE
             )
-        elif ospath.exists(self.token_path):
-            LOGGER.info(f"Authorize with {self.token_path}")
-            with open(self.token_path, "rb") as f:
-                credentials = pload(f)
         else:
-            LOGGER.error("token.pickle not found!")
-        if credentials is None:
+            # Preserve support for the standard token and per-user token files.
+            token_path = self.token_path
+            if not ospath.isfile(token_path) and token_path != "token.pickle":
+                LOGGER.warning("Per-user token %s is missing; checking token.pickle fallback", token_path)
+                token_path = "token.pickle"
+            if ospath.isfile(token_path):
+                LOGGER.info("Loading Google Drive OAuth credentials from %s", token_path)
+                try:
+                    with open(token_path, "rb") as token_file:
+                        credentials = pload(token_file)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Could not read {token_path}. Regenerate the OAuth token pickle "
+                        "with the project's token generator."
+                    ) from exc
+            else:
+                raise ValueError(
+                    f"Google Drive token not found ({self.token_path} or token.pickle). "
+                    "Add a valid OAuth token pickle or enable service accounts."
+                )
+
+            if credentials is not None and getattr(credentials, "expired", False):
+                if getattr(credentials, "refresh_token", None):
+                    try:
+                        credentials.refresh(Request())
+                        # Persist refreshed credentials so the next run does not reuse an expired token.
+                        import pickle
+                        token_dir = ospath.dirname(token_path)
+                        if token_dir:
+                            from os import makedirs
+                            makedirs(token_dir, exist_ok=True)
+                        with open(token_path, "wb") as token_file:
+                            pickle.dump(credentials, token_file, protocol=pickle.HIGHEST_PROTOCOL)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Google Drive OAuth token in {token_path} is expired and could not "
+                            "be refreshed. Regenerate the token pickle and ensure OAuth access "
+                            "is still authorized."
+                        ) from exc
+
+        if credentials is None or not getattr(credentials, "valid", True):
             raise ValueError(
-                "No valid credentials found. Provide a token.pickle or enable service accounts."
+                "Google Drive credentials are invalid. Check the OAuth token pickle or "
+                "service-account JSON and regenerate credentials if needed."
             )
         return build("drive", "v3", credentials=credentials, cache_discovery=False)
 

@@ -199,10 +199,18 @@ class TaskConfig:
         if set_all_meta:
             v = self.user_dict.get("SET_ALL_METADATA")
             parsed_v = v if isinstance(v, dict) else (self.metadata_processor.parse_string(v) if isinstance(v, str) else {})
-            self.default_metadata_dict = parsed_v
-            self.audio_metadata_dict = parsed_v
-            self.video_metadata_dict = parsed_v
-            self.subtitle_metadata_dict = parsed_v
+            # Generic title is a video-stream title, not a note to append to
+            # every audio/subtitle language. Keep other SET_ALL tags on all tracks.
+            self.default_metadata_dict = dict(parsed_v)
+            self.video_metadata_dict = dict(parsed_v)
+            self.audio_metadata_dict = {
+                k: val for k, val in parsed_v.items()
+                if str(k).strip().lower() != "title"
+            }
+            self.subtitle_metadata_dict = {
+                k: val for k, val in parsed_v.items()
+                if str(k).strip().lower() != "title"
+            }
         else:
             for k in ("METADATA", "AUDIO_METADATA", "VIDEO_METADATA", "SUBTITLE_METADATA"):
                 v = self.user_dict.get(k, {})

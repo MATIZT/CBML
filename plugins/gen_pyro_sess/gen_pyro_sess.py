@@ -232,14 +232,14 @@ async def gen_pyro_string(_, message):
 
     try:
         pyro_client = Client(
-            f"HTR-X-{user_id}",
+            f"cantarellabots-{user_id}",
             in_memory=True,
             api_id=api_id,
             api_hash=api_hash,
             workdir="/usr/src/app",
-            app_version=f"@HTR_X {get_version()}",
-            device_model="@HTR_X Bot V3",
-            system_version="@HTR_X WzPyro Server",
+            app_version=f"@cantarellabots {get_version()}",
+            device_model="@cantarellabots Bot V3",
+            system_version="@cantarellabots WzPyro Server",
         )
     except Exception as e:
         return await edit_message(
@@ -360,7 +360,7 @@ async def gen_pyro_string(_, message):
         )
 
     for ext in ("session", "session-journal"):
-        path = f"HTR-X-{user_id}.{ext}"
+        path = f"cantarellabots-{user_id}.{ext}"
         if path_exists(path):
             try:
                 await aioremove(path)

@@ -394,6 +394,15 @@ async def cmd_exec(cmd, shell=False):
     return stdout, stderr, proc.returncode
 
 
+def new_thread(func):
+    """Schedule an async helper on the bot event loop and return its task."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return bot_loop.create_task(func(*args, **kwargs))
+
+    return wrapper
+
+
 def new_task(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):

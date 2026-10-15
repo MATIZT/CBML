@@ -250,7 +250,7 @@ DEFAULT_DESP = {
     "HYDRA_API_KEY": "Hydra API key.",
     "NAME_SWAP": "Rename pattern rules.",
     "OWNER_ID": "Bot owner user ID.",
-    "PROGRESS_BAR": "Custom progress bar characters (filled and empty). Default: ■□.",
+    "PROGRESS_BAR": "Telegram status bar style. Default: ▰ filled and ▱ empty (10 blocks).",
     "QUEUE_ALL": "Max parallel tasks.",
     "QUEUE_DOWNLOAD": "Max parallel download tasks.",
     "QUEUE_UPLOAD": "Max parallel upload tasks.",
@@ -553,6 +553,8 @@ async def get_buttons(key=None, edit_type=None, edit_mode=False):
         for k in ONOFF_VARS:
             val = Config.get(k)
             label = k.removeprefix("DISABLE_")
+            if k == "DISABLE_STREAM":
+                label = f"STREAM: {'OFF' if val else 'ON'}"
             if not val:
                 buttons.data_button(
                     f"✓ {label}",

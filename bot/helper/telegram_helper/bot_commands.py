@@ -5,6 +5,7 @@ from ...core.plugin_manager import get_plugin_manager
 class BotCommands:
     _static_commands = {
         "Start": "start",
+        "Api": "api",
         "Login": "login",
         "Mirror": ["mirror", "m"],
         "QbMirror": ["qbmirror", "qm"],
@@ -15,7 +16,7 @@ class BotCommands:
         "CookieSettings": ["cookiesettings", "cookies"],
         "UpHoster": ["uphoster", "up"],
         "NzbMirror": ["nzbmirror", "nm"],
-        "Leech": ["leech", "l"],
+        "Leech": ["leech", "l", "lh"],
         "QbLeech": ["qbleech", "ql"],
         "JdLeech": ["jdleech", "jl"],
         "YtdlLeech": ["ytdlleech", "yl"],

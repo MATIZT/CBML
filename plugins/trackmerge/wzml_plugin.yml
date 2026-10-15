@@ -1,6 +1,6 @@
 name: trackmerge
 version: "1.1.0"
-author: HTR-X
+author: cantarellabots
 description: Merge a video with external audio/subtitle files or download links using an interactive track planner
 license: MIT
 tags: [media, merge, ffmpeg, tracks]

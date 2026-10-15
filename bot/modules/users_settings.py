@@ -731,6 +731,8 @@ async def get_user_settings(from_user, stype="main"):
         buttons.data_button(f"{r_state}Random Thumbnail", f"userset {user_id} thumb_mode random")
         buttons.data_button(f"{n_state}No Thumbnail", f"userset {user_id} thumb_mode none")
 
+        hd_state = "✓ " if user_dict.get("HD_THUMBNAIL", False) else ""
+        buttons.data_button(f"✨ {hd_state}HD Thumbnail", f"userset {user_id} thumb_hd")
         buttons.data_button("🖼️ Thumbnail Watermark", f"userset {user_id} thumb_wm_menu")
 
         if cur_mode == "custom" and has_thumb:
@@ -1531,6 +1533,12 @@ The bot does not guess undocumented endpoints.</blockquote>
             buttons.data_button(
                 "Subtitle Metadata", f"userset {user_id} menu SUBTITLE_METADATA"
             )
+
+        track_data_enabled = bool(user_dict.get("TRACK_DATA_ENABLE", False))
+        buttons.data_button(
+            f"🎚️ Track Data: {'ON' if track_data_enabled else 'OFF'}",
+            f"userset {user_id} tog TRACK_DATA_ENABLE {'f' if track_data_enabled else 't'}",
+        )
 
         metadata_setting = user_dict.get("METADATA")
         display_meta_val = "<b>Not Set</b>"
@@ -2383,6 +2391,12 @@ async def edit_user_settings(client, query):
             await query.answer("Please set a custom thumbnail image!", show_alert=True)
         else:
             await query.answer()
+        await update_user_settings(query, "thumb_select")
+    elif data[2] == "thumb_hd":
+        enabled = not bool(user_dict.get("HD_THUMBNAIL", False))
+        update_user_ldata(user_id, "HD_THUMBNAIL", enabled)
+        await database.update_user_data(user_id)
+        await query.answer(f"HD thumbnail {'enabled' if enabled else 'disabled'}")
         await update_user_settings(query, "thumb_select")
     elif data[2] == "mega":
         await query.answer()

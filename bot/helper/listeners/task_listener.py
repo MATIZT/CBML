@@ -250,6 +250,77 @@ class TaskListener(TaskConfig):
                 return
 
         dl_path = f"{self.dir}/{self.name}"
+        # Video + Video must use the same merge pipeline as -ht (Normal/Advanced),
+        # not the standalone Vt2 executor. For archive inputs, extract first so
+        # the existing merge pipeline sees the videos rather than the ZIP file.
+        vt_mode = getattr(self, "vt_mode", None)
+        vid_mode = getattr(self, "vidMode", None)
+        selected_vt_mode = (vid_mode[0] if isinstance(vid_mode, (list, tuple)) and vid_mode else vt_mode)
+        defer_vt_video_merge = bool(
+            getattr(self, "vt_requested", False) and selected_vt_mode == "vid_vid"
+        )
+        if defer_vt_video_merge:
+            archive_exts = (".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2", ".001")
+            if ospath.splitext(dl_path)[1].lower() in archive_exts:
+                self.extract = True
+            self.auto_merge = True
+            self.manual_merge = False
+            self.vidMode = None
+            LOGGER.info(
+                "Video + Video delegated to existing -ht merge flow (mode=%s); extract=%s",
+                getattr(self, "merge_mode", None) or self.user_dict.get("AUTO_MERGE_MODE", "normal"),
+                bool(self.extract),
+            )
+        # Other Video Tools operations use the Vt2 executor. MULTI VT is a
+        # sequential chain: each operation finishes before the next is selected.
+        if (getattr(self, "vt_requested", False) and getattr(self, "vidMode", None)
+                and not defer_vt_video_merge):
+            try:
+                from secrets import token_urlsafe
+                from ..video_utils.executor import VidEcxecutor
+                from ..video_utils.selector import SelectMode
+                from ..telegram_helper.filters import CustomFilters
+                gid = token_urlsafe(12)
+                mode_name = getattr(self, "vt_mode", None) or self.vidMode[0]
+                privileged_vt_modes = {"compress", "convert", "watermark"}
+                is_privileged = await CustomFilters.sudo("", self.message)
+                while self.vidMode:
+                    mode_name, selected_name, kwargs = self.vidMode
+                    if mode_name in privileged_vt_modes and not is_privileged:
+                        LOGGER.warning(
+                            "Blocked restricted Video Tool '%s' for non-sudo user %s",
+                            mode_name, self.user_id,
+                        )
+                        await self.on_upload_error(
+                            f"{mode_name.title()} is available only to the bot owner or sudo users."
+                        )
+                        return
+                    kwargs = dict(kwargs or {})
+                    multi_vt = bool(kwargs.pop('_multi_vt', False))
+                    self.vidMode = [mode_name, selected_name, kwargs]
+                    LOGGER.info("Video Tools processing started: %s", mode_name or 'Rename')
+                    result_path = await VidEcxecutor(self, dl_path, gid, False).execute()
+                    if result_path and await aiopath.exists(str(result_path)):
+                        dl_path = str(result_path)
+                        self.name = ospath.basename(dl_path)
+                    else:
+                        await self.on_upload_error(f"Video tool failed: {mode_name or 'Rename'}")
+                        return
+                    LOGGER.info("Video Tools processing completed: %s", mode_name or 'Rename')
+                    if not multi_vt:
+                        break
+                    # Preserve the current output as the input to the next tool.
+                    self.link = dl_path
+                    self.name = ospath.basename(dl_path)
+                    self.vidMode = await SelectMode(self, False, multi_vt=True).get_buttons()
+                    if not self.vidMode or getattr(self, 'is_cancelled', False):
+                        self.vidMode = None
+                        break
+                self.vidMode = None
+            except Exception as e:
+                LOGGER.error("Video Tools processing failed", exc_info=True)
+                await self.on_upload_error(f"Video Tools failed: {e}")
+                return
         self.size = await get_path_size(dl_path)
         self.is_file = await aiopath.isfile(dl_path)
 
@@ -623,19 +694,27 @@ class TaskListener(TaskConfig):
                     fmsg = ""
                     for index, (link, name) in enumerate(files.items(), start=1):
                         fmsg += f"{index}. <a href='{link}'>{name}</a>"
-                        if Config.MEDIA_STORE:
-                            parts = link.split("/")[-2:]
-                            if len(parts) == 2:
-                                chat_id, msg_id = parts
-                                if chat_id.isdigit():
-                                    chat_id = f"-100{chat_id}"
-                                flink = f"https://t.me/{TgClient.BNAME}?start={encode_slink('file' + chat_id + '&&' + msg_id)}"
-                                fmsg += f"\n  ↳ <a href='{flink}'>Store Link</a> | <a href='https://t.me/share/url?url={flink}'>Share Link</a>"
-                                from ...modules.stream import gen_stream_link
+                        # File-store links and web stream links are independent features.
+                        # Previously stream links were generated only inside MEDIA_STORE,
+                        # so turning Media Store off also removed Stream/Download links.
+                        parts = link.split("/")[-2:]
+                        if len(parts) == 2:
+                            chat_id, msg_id = parts
+                            clean_msg_id = msg_id.split("?", 1)[0].split("#", 1)[0]
+                            if chat_id.isdigit() and clean_msg_id.isdigit():
+                                private_chat_id = f"-100{chat_id}"
+                                if Config.MEDIA_STORE:
+                                    flink = f"https://t.me/{TgClient.BNAME}?start={encode_slink('file' + private_chat_id + '&&' + clean_msg_id)}"
+                                    fmsg += f"\n  ↳ <a href='{flink}'>Store Link</a> | <a href='https://t.me/share/url?url={flink}'>Share Link</a>"
+                                if not Config.DISABLE_STREAM:
+                                    try:
+                                        from ...modules.stream import gen_stream_link
 
-                                slinks = await gen_stream_link(chat_id, msg_id)
-                                if slinks:
-                                    fmsg += f"\n  ↳ <a href='{slinks[0]}'>Stream</a> | <a href='{slinks[1]}'>Download</a>"
+                                        slinks = await gen_stream_link(private_chat_id, clean_msg_id)
+                                        if slinks:
+                                            fmsg += f"\n  ↳ <a href='{slinks[0]}'>Stream</a> | <a href='{slinks[1]}'>Download</a>"
+                                    except Exception as e:
+                                        LOGGER.warning(f"Could not add stream links to file list for {name}: {e}")
                         fmsg += "\n"
                         if len(fmsg.encode() + full_msg.encode()) > 4000:
                             await send_message(dm_target, full_msg + fmsg)

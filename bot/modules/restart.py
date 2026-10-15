@@ -271,7 +271,13 @@ async def confirm_restart(_, query):
             if scheduler.running:
                 scheduler.shutdown(wait=False)
 
-            await mega_cleanup()
+            # A cleanup failure must never leave the bot half-shutdown.
+            # Log and continue to the process replacement even if an optional
+            # integration (Mega, torrent, downloader, etc.) fails to stop.
+            try:
+                await mega_cleanup()
+            except Exception:
+                LOGGER.exception("Restart: Mega cleanup failed; continuing restart")
 
             sabnzbd_task = None
             jd_task = None
@@ -318,30 +324,49 @@ async def confirm_restart(_, query):
                 except Exception:
                     pass
 
-            await TgClient.stop()
+            try:
+                await TgClient.stop()
+            except Exception:
+                LOGGER.exception("Restart: Telegram client shutdown failed; continuing restart")
 
-            THREAD_POOL.shutdown(wait=False)
+            try:
+                THREAD_POOL.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                THREAD_POOL.shutdown(wait=False)
+            except Exception:
+                LOGGER.exception("Restart: thread-pool shutdown failed; continuing restart")
 
-            await cmd_exec(
-                [
-                    "pkill",
-                    "-9",
-                    "-f",
-                    f"gunicorn|{BinConfig.ARIA2_NAME}|{BinConfig.QBIT_NAME}|{BinConfig.FFMPEG_NAME}|{BinConfig.RCLONE_NAME}|java|{BinConfig.SABNZBD_NAME}|7z|split",
-                ]
-            )
+            try:
+                await cmd_exec(
+                    [
+                        "pkill", "-9", "-f",
+                        f"gunicorn|{BinConfig.ARIA2_NAME}|{BinConfig.QBIT_NAME}|{BinConfig.FFMPEG_NAME}|{BinConfig.RCLONE_NAME}|java|{BinConfig.SABNZBD_NAME}|7z|split",
+                    ]
+                )
+            except Exception:
+                LOGGER.exception("Restart: optional process cleanup failed; continuing restart")
 
-            await cmd_exec(["python3", "update.py"])
+            # Updating the checkout is optional. Never let update.py prevent
+            # the bot process from being relaunched.
+            try:
+                await cmd_exec(["python3", "update.py"])
+            except Exception:
+                LOGGER.exception("Restart: update.py failed; continuing restart")
 
             try:
                 async with aiopen(".restartmsg", "w") as f:
                     await f.write(f"{restart_message.chat.id}\n{restart_message.id}\n")
             except Exception:
-                pass
+                LOGGER.exception("Restart: could not save restart notification")
 
             from bot import bot_loop
-            bot_loop.create_task(_background_cleanup())
+            try:
+                bot_loop.create_task(_background_cleanup())
+            except Exception:
+                LOGGER.exception("Restart: background cleanup scheduling failed")
 
+            LOGGER.warning("Restart: replacing process with %s -m bot", executable)
+            # exec replaces this process; systemd keeps supervising the same PID.
             osexecl(executable, executable, "-m", "bot")
     else:
         await delete_message(message, reply_to)

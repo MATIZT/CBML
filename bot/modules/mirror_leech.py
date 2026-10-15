@@ -161,12 +161,14 @@ class Mirror(TaskListener):
             "-ut": False,
             "-ad": False,
             "-yt": False,
+            "-vt": False,
             "-seedr": False,
             "-ht": False,
             "-trackmanager": False,
             "-tr": False,
             "-track": False,
             "-tm": False,
+            "-tc": False,
             "-i": 0,
             "-sp": 0,
             "link": "",
@@ -187,6 +189,13 @@ class Mirror(TaskListener):
             "-tl": "",
             "-ff": set(),
         }
+
+        # -vt is a standalone boolean flag. The generic parser otherwise treats
+        # the following URL as its value (e.g. `/lh -vt https://...`), which
+        # leaves args['link'] empty and prevents the menu from opening.
+        if "-vt" in input_list:
+            args["-vt"] = True
+            input_list = [token for token in input_list if token != "-vt"]
 
         if input_list and input_list[0].startswith("/"):
             arg_parser(input_list[1:], args)
@@ -250,6 +259,8 @@ class Mirror(TaskListener):
         self.is_alldebrid = args["-ad"]
         self.is_seedr = args["-seedr"] or self.is_seedr
         self.is_yt = args["-yt"]
+        self.vt_requested = bool(args.get("-vt", False))
+        self.vt_mode = None
 
         user_auto_merge = self.user_dict.get("AUTO_MERGE", False) or (
             "AUTO_MERGE" not in self.user_dict and getattr(Config, "AUTO_MERGE", False)
@@ -265,11 +276,27 @@ class Mirror(TaskListener):
             or args["-tr"]
             or args["-track"]
             or args["-tm"]
+            or args["-tc"]
             or any(
                 f in self.options
-                for f in ("-trackmanager", "-tr", "-track", "-tm")
+                for f in ("-trackmanager", "-tr", "-track", "-tm", "-tc")
             )
         )
+
+        # Resolve gdflix.dev links through the API configured by this user before download dispatch.
+        if self.link and "gdflix.dev/" in self.link.lower():
+            try:
+                from .api_manager import resolve_gdflix
+                resolved_api_link = await resolve_gdflix(self.link, self.user_id)
+                if resolved_api_link:
+                    self.link = resolved_api_link
+                else:
+                    await send_message(self.message, "⚠️ Could not resolve this gdflix.dev link. Configure a working API with /api in DM.")
+                    return
+            except Exception as api_exc:
+                LOGGER.warning("gdflix API resolution failed: %s", api_exc)
+                await send_message(self.message, "⚠️ Download API resolution failed. Check your /api configuration.")
+                return
 
         from ..helper.ext_utils.task_manager import get_task_key
         task_source = self.link or (self.message.reply_to_message.text if self.message.reply_to_message and self.message.reply_to_message.text else "") or self.name
@@ -535,6 +562,17 @@ class Mirror(TaskListener):
 
         if len(self.link) > 0:
             LOGGER.info(self.link)
+
+        # Full Vt2 selector: collect operation-specific options before download.
+        if self.vt_requested:
+            from ..helper.video_utils.selector import SelectMode
+            self.vidMode = await SelectMode(self, False).get_buttons()
+            if not self.vidMode or getattr(self, "is_cancelled", False):
+                await send_message(self.message, "<blockquote>Video Tools cancelled or timed out; download was not started.</blockquote>")
+                await self.remove_from_same_dir()
+                await delete_links(self.message)
+                return
+            self.vt_mode = self.vidMode[0]
 
         try:
             await self.before_start()

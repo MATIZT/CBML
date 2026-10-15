@@ -66,7 +66,13 @@ class HypertgDownload(HypertgTransfer):
 
     def __init__(self, obj):
         super().__init__(obj)
-        self.chunk_size = max(Config.HYPER_CHUNK or 512 * self.KB, self._MIN_CHUNK)
+        # Telegram upload.GetFile requires a valid, aligned byte range. Keep
+        # the request size within Telegram's 1 MiB maximum and on 4 KiB boundaries.
+        requested_chunk = int(Config.HYPER_CHUNK or 512 * self.KB)
+        requested_chunk = max(self._MIN_CHUNK, min(requested_chunk, 1024 * self.KB))
+        self.chunk_size = max(
+            self._MIN_CHUNK, (requested_chunk // (4 * self.KB)) * (4 * self.KB)
+        )
         self.num_parts = Config.HYPER_THREADS or max(
             self._LOW_WORKERS, min(self._HIGH_WORKERS, self.num_clients)
         )

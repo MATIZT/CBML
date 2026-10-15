@@ -10,6 +10,7 @@ except ImportError:
     FloodPremiumWait = FloodWait
 
 from os import path as ospath
+import hashlib
 from aiofiles.os import path as aiopath, remove
 
 from ... import LOGGER
@@ -45,27 +46,123 @@ class HypertgUpload(HypertgTransfer):
             self._use_user_bots = True
 
     def _auto_thumb_enabled(self):
-        return self._listener.user_dict.get("AUTO_THUMBNAIL", False) or (
-            "AUTO_THUMBNAIL" not in self._listener.user_dict and getattr(Config, "AUTO_THUMBNAIL", False)
-        )
+        """Respect the modern thumbnail mode setting, with legacy-config fallback."""
+        user_settings = self._listener.user_dict
+        mode = user_settings.get("THUMBNAIL_MODE")
+        if mode is not None:
+            return str(mode).strip().lower() == "auto"
+        legacy = user_settings.get("AUTO_THUMBNAIL")
+        return bool(getattr(Config, "AUTO_THUMBNAIL", False) if legacy is None else legacy)
 
-    async def _get_auto_thumb(self, file_path, is_video=False, duration=0, is_audio=False):
+    async def _make_hd_thumbnail(self, thumb, file_path):
+        """Enhance the selected thumbnail when HD mode is enabled.
+
+        This runs after custom/automatic/random thumbnail selection, so the
+        same treatment applies to every selected source. Upscaling improves
+        output dimensions but cannot recreate detail absent from the source.
+        Telegram itself may still resize its small preview thumbnail.
+        """
+        if not self._listener.user_dict.get("HD_THUMBNAIL", False):
+            return thumb
+        if not thumb or thumb == "none" or not await aiopath.exists(str(thumb)):
+            return thumb
+
+        import os
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+
+        def _resize():
+            try:
+                with Image.open(thumb) as source:
+                    # Work in RGB and avoid repeatedly recompressing the input.
+                    image = source.convert("RGB")
+                    width, height = image.size
+                    longest = max(width, height)
+                    target = 7680
+                    if longest < target:
+                        scale = target / float(longest)
+                        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                        resampling = getattr(Image, "Resampling", Image)
+                        image = image.resize(size, getattr(resampling, "LANCZOS", Image.LANCZOS))
+
+                    # Polish the selected source without replacing its artwork.
+                    # Lanczos improves resampling; gentle brightness, contrast,
+                    # color and edge sharpening improve perceived clarity. Upscaling
+                    # cannot recreate detail that was not present in the source.
+                    image = ImageOps.autocontrast(image, cutoff=0.2)
+                    image = ImageEnhance.Brightness(image).enhance(1.055)
+                    image = ImageEnhance.Contrast(image).enhance(1.12)
+                    image = ImageEnhance.Color(image).enhance(1.04)
+                    image = ImageEnhance.Sharpness(image).enhance(1.08)
+                    image = image.filter(
+                        ImageFilter.UnsharpMask(radius=1.6, percent=125, threshold=3)
+                    )
+
+                    os.makedirs("thumbnails/hd", exist_ok=True)
+                    digest = hashlib.sha256(
+                        f"{self._listener.user_id}:{file_path}:{thumb}".encode()
+                    ).hexdigest()[:16]
+                    output = f"thumbnails/hd/{digest}.jpg"
+                    image.save(
+                        output,
+                        "JPEG",
+                        quality=98,
+                        subsampling=0,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    return output
+            except Exception as exc:
+                LOGGER.warning(f"HD thumbnail enhancement failed; using original thumbnail: {exc}")
+                return thumb
+
+        return await sync_to_async(_resize)
+
+    async def _get_auto_thumb(
+        self, file_path, is_video=False, duration=0, is_audio=False, as_doc=False
+    ):
         if not self._auto_thumb_enabled():
             return None
 
-        # 1. Try TMDb poster lookup
-        auto_t = await get_auto_thumbnail(file_path)
+        # IMDb title search is attempted first. Video uploads request the first
+        # landscape still/backdrop; document uploads request the portrait poster.
+        auto_t = await get_auto_thumbnail(file_path, as_doc=as_doc or not is_video)
         if auto_t and await aiopath.exists(str(auto_t)):
             return auto_t
 
-        # 2. Local fallback if TMDb fails
-        if self._listener.thumbnail_layout and is_video:
-            grid_t = await get_multiple_frames_thumbnail(file_path, self._listener.thumbnail_layout, False)
+        # If no catalogue image exists, retain the local-frame fallback. For a
+        # document-uploaded video crop the frame to portrait proportions.
+        if self._listener.thumbnail_layout and is_video and not as_doc:
+            grid_t = await get_multiple_frames_thumbnail(
+                file_path, self._listener.thumbnail_layout, False
+            )
             if grid_t and await aiopath.exists(str(grid_t)):
                 return grid_t
 
         if is_video:
-            return await get_video_thumbnail(file_path, duration)
+            frame = await get_video_thumbnail(file_path, duration)
+            if frame and as_doc and await aiopath.exists(str(frame)):
+                try:
+                    def _portrait_crop():
+                        from PIL import Image, ImageOps
+                        import hashlib
+                        import os
+
+                        with Image.open(frame) as source:
+                            image = ImageOps.fit(
+                                source.convert("RGB"),
+                                (480, 720),
+                                method=Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS,
+                                centering=(0.5, 0.42),
+                            )
+                            os.makedirs("thumbnails/auto_portrait", exist_ok=True)
+                            digest = hashlib.sha256(str(file_path).encode()).hexdigest()[:16]
+                            output = f"thumbnails/auto_portrait/{digest}.jpg"
+                            image.save(output, "JPEG", quality=92, optimize=True)
+                            return output
+                    frame = await sync_to_async(_portrait_crop)
+                except Exception as exc:
+                    LOGGER.debug("Could not crop fallback thumbnail to portrait: %s", exc)
+            return frame
         elif is_audio:
             return await get_audio_thumbnail(file_path)
 
@@ -108,7 +205,18 @@ class HypertgUpload(HypertgTransfer):
 
         thumb = None
         if thumb_mode == "auto":
-            thumb = await self._get_auto_thumb(file_path, is_video=is_video, duration=duration, is_audio=is_audio)
+            send_as_document = (
+                force_document
+                or self._listener.as_doc
+                or (not is_video and not is_audio and not is_image)
+            )
+            thumb = await self._get_auto_thumb(
+                file_path,
+                is_video=is_video,
+                duration=duration,
+                is_audio=is_audio,
+                as_doc=send_as_document,
+            )
         elif thumb_mode == "custom":
             if user_thumb and user_thumb != "none" and await aiopath.exists(str(user_thumb)):
                 thumb = user_thumb
@@ -122,6 +230,7 @@ class HypertgUpload(HypertgTransfer):
             thumb = None
 
         if thumb and thumb != "none" and await aiopath.exists(str(thumb)):
+            thumb = await self._make_hd_thumbnail(thumb, file_path)
             thumb = await apply_thumbnail_watermark(thumb, self._listener.user_dict)
 
         if (
@@ -182,30 +291,23 @@ class HypertgUpload(HypertgTransfer):
             use_hyper = (
             (Config.USE_HYPER or getattr(self, "_use_user_bots", False))
             and self.clients
-            and up_size > 10 * 1024 * 1024
             and getattr(self._listener, "tg_user_client", None) is None
         )
-        # Upload only to a configured dump destination; otherwise DM the requester.
-        # AUTHORIZED_CHATS controls access and is never treated as an upload target.
-        raw_auth = str(getattr(Config, "AUTHORIZED_CHATS", "") or "")
-        auth_ids = set()
-        for raw in raw_auth.split():
-            base = raw.split("|", 1)[0].strip()
-            if base.lstrip("-").isdigit():
-                auth_ids.add(int(base))
+        # Reuse the resolved destination from TelegramUploader. A separate
+        # destination calculation here used to send media somewhere other than
+        # the starter message (especially for preset dumps and per-user dumps).
+        upload_chat_id = getattr(self._listener, "_upload_chat_id", None)
+        if upload_chat_id is None:
+            upload_chat_id = reply_target.chat.id
+        thread_id = getattr(self._listener, "_upload_thread_id", None)
+        if upload_chat_id != reply_target.chat.id:
+            # Never reply to a message from another chat.
+            reply_to_message_id = None
 
-        candidate = self._listener.up_dest or Config.LEECH_LOG_CHAT
-        if candidate:
-            upload_chat_id, thread_id = parse_dest(candidate) if not isinstance(candidate, int) else (candidate, None)
-        else:
-            upload_chat_id, thread_id = self._listener.user_id, None
-
-        if upload_chat_id in auth_ids:
-            upload_chat_id, thread_id = self._listener.user_id, None
-            LOGGER.warning(
-                "HyperUP blocked AUTHORIZED_CHATS destination; falling back to DM %s",
-                self._listener.user_id,
-            )
+        # Destination validation and AUTHORIZED_CHATS policy are handled when
+        # TelegramUploader resolves the task destination. Do not re-check an
+        # undefined local auth_ids variable here, and do not silently redirect
+        # a valid explicitly configured dump destination to the user's DM.
         try:
             if use_hyper:
                 hyper_rply = (
@@ -213,21 +315,59 @@ class HypertgUpload(HypertgTransfer):
                     if upload_chat_id == reply_target.chat.id
                     else None
                 )
-                sent = await self._hyper_send(
-                    file_path,
-                    key,
-                    thumb,
-                    cap_mono,
-                    upload_chat_id,
-                    hyper_rply,
-                    thread_id,
-                    duration=duration,
-                    width=width,
-                    height=height,
-                    artist=artist,
-                    title=title,
-                    user_only=hyper_user_only,
-                )
+                try:
+                    sent = await self._hyper_send(
+                        file_path,
+                        key,
+                        thumb,
+                        cap_mono,
+                        upload_chat_id,
+                        hyper_rply,
+                        thread_id,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        artist=artist,
+                        title=title,
+                        user_only=hyper_user_only,
+                    )
+                except Exception as hyper_error:
+                    # A helper bot may not have permission/contact with this
+                    # destination even though the task's primary client does.
+                    # Fall back only for permission/peer errors to avoid a
+                    # duplicate upload after an ambiguous transport timeout.
+                    error_text = str(hyper_error).upper().replace(" ", "_")
+                    fallback_markers = (
+                        "CHAT_WRITE_FORBIDDEN",
+                        "CHAT_ADMIN_REQUIRED",
+                        "USER_IS_BLOCKED",
+                        "USER_PRIVACY_RESTRICTED",
+                        "PEER_ID_INVALID",
+                        "CHAT_ID_INVALID",
+                        "BOT_METHOD_INVALID",
+                        "FORBIDDEN",
+                    )
+                    if not any(marker in error_text for marker in fallback_markers):
+                        raise
+                    LOGGER.warning(
+                        "HyperUP helper cannot write to destination; retrying with primary client: %s",
+                        hyper_error,
+                    )
+                    sent = await self._direct_send(
+                        file_path,
+                        key,
+                        thumb,
+                        cap_mono,
+                        upload_chat_id,
+                        hyper_rply,
+                        thread_id,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        artist=artist,
+                        title=title,
+                        user_session=user_session,
+                    )
             else:
                 direct_rply = (
                     reply_to_message_id
@@ -274,12 +414,35 @@ class HypertgUpload(HypertgTransfer):
                         pass
 
     async def _send_with_retry(self, send_func, **kwargs):
+        timeout_attempts = 0
         while True:
             try:
                 return await send_func(**kwargs)
             except (FloodWait, FloodPremiumWait) as f:
-                LOGGER.warning(f"HypertgUL flood {f.value}s on {self._up_file}")
-                await sleep(f.value + 1)
+                wait_seconds = max(1, int(getattr(f, "value", 1)))
+                LOGGER.warning(
+                    "HypertgUL flood wait %ss on %s", wait_seconds, self._up_file
+                )
+                await sleep(wait_seconds + 1)
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                timeout_attempts += 1
+                if timeout_attempts >= 3:
+                    LOGGER.error(
+                        "HypertgUL Telegram request timed out after %s attempts on %s: %s",
+                        timeout_attempts,
+                        self._up_file,
+                        exc,
+                    )
+                    raise
+                delay = min(2 ** timeout_attempts, 8)
+                LOGGER.warning(
+                    "HypertgUL transient network error (%s/3) on %s: %s; retrying in %ss",
+                    timeout_attempts,
+                    self._up_file,
+                    exc,
+                    delay,
+                )
+                await sleep(delay)
 
     async def _try_send(self, key, client, kwargs):
         try:

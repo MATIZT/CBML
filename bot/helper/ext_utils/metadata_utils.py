@@ -1,7 +1,7 @@
 from os.path import basename, splitext
 from re import compile as re_compile
 from pycountry import languages
-from ..ext_utils.media_utils import get_streams
+from ..ext_utils.media_utils import get_streams, normalize_language_tag
 
 
 class MetadataProcessor:
@@ -15,18 +15,22 @@ class MetadataProcessor:
 
     @staticmethod
     def convert_lang_code(lang_code):
-        if not lang_code or lang_code in {"unknown", "und", "none"}:
+        if not lang_code:
             return lang_code
+        clean = normalize_language_tag(lang_code)
+        if not clean:
+            return "unknown"
         try:
-            if len(lang_code) == 2:
-                lang = languages.get(alpha_2=lang_code.lower())
-            elif len(lang_code) == 3:
-                lang = languages.get(alpha_3=lang_code.lower())
+            if len(clean) == 2:
+                lang = languages.get(alpha_2=clean.lower())
+            elif len(clean) == 3:
+                lang = languages.get(alpha_3=clean.lower())
             else:
-                return lang_code
-            return lang.name if lang else lang_code
+                lang = languages.get(name=clean.title())
+            return lang.name if lang else clean
         except Exception:
-            return lang_code
+            return clean
+
 
     async def extract_file_vars(self, file_path):
         fname = basename(file_path)
@@ -137,6 +141,40 @@ class MetadataProcessor:
 
     def sanitize(self, value):
         return self._sanitize_pattern.sub("_", str(value))[:100]
+
+    @staticmethod
+    def route_global_title_to_video(global_metadata, video_metadata, streams):
+        """Route generic title metadata to a real video stream, never audio/subtitles.
+
+        The generic metadata title is removed from container-level metadata. If a
+        real video stream exists, it becomes its stream title. Attached cover-art
+        streams do not count as videos.
+        """
+        if not isinstance(global_metadata, dict):
+            return
+        title_items = [(key, value) for key, value in global_metadata.items()
+                       if str(key).strip().lower() == "title"]
+        if not title_items:
+            return
+        # Last configured title wins, then remove every spelling/case variant.
+        title_value = title_items[-1][1]
+        for key, _ in title_items:
+            global_metadata.pop(key, None)
+        if title_value is None or not str(title_value).strip():
+            return
+        has_video = any(
+            str(stream.get("codec_type", "")).lower() == "video"
+            and not bool((stream.get("disposition") or {}).get("attached_pic", 0))
+            for stream in (streams or [])
+        )
+        if not has_video or not isinstance(video_metadata, dict):
+            return
+        # The generic title is the configured title value (not a note to
+        # append); collapse case variants to one canonical video-stream tag.
+        for key in list(video_metadata):
+            if str(key).strip().lower() == "title":
+                video_metadata.pop(key, None)
+        video_metadata["title"] = str(title_value)
 
     async def process_all(
         self,

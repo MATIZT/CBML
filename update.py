@@ -207,8 +207,7 @@ def _update_packages():
     # One-time (per boot) yt-dlp nightly: YouTube breaks stable builds often
     # ("page needs to be reloaded" / "Requested format is not available").
     # Installed together with its extras so yt-dlp-ejs stays version-matched.
-    scall(f'{pip_cmd} install -U --pre "yt-dlp[default,curl-cffi]"', shell=True)
-    scall(f"{pip_cmd} install -U yt-dlp-ejs", shell=True)
+    scall(f'{pip_cmd} install -U --pre "yt-dlp[default,curl-cffi]" "yt-dlp-ejs"', shell=True)
     _LOGGER.info("Successfully Updated all the Packages!")
 
 

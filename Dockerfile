@@ -4,6 +4,8 @@ COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 WORKDIR /usr/src/app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+RUN test -x /wzvenv/bin/python || (echo "ERROR: base image does not provide /wzvenv/bin/python" >&2; exit 1)
 
 COPY requirements.txt .
 RUN uv pip install --python /wzvenv/bin/python --no-cache-dir -r requirements.txt
@@ -12,4 +14,4 @@ RUN uv pip install --python /wzvenv/bin/python --no-cache-dir --no-deps "mega.py
 
 COPY . .
 
-ENTRYPOINT ["bash", "start.sh"]
+CMD ["bash", "start.sh"]

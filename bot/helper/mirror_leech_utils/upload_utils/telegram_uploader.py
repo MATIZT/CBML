@@ -3,6 +3,10 @@ from logging import getLogger
 from os import path as ospath, walk
 from re import match as re_match, sub as re_sub
 from time import time
+import json
+import os
+import tempfile
+from contextlib import suppress
 
 from aioshutil import rmtree
 from natsort import natsorted
@@ -33,7 +37,7 @@ from ...ext_utils.bot_utils import sync_to_async
 from ...ext_utils.files_utils import get_base_name, is_archive
 from ...ext_utils.status_utils import get_readable_file_size, get_readable_time
 
-from ...ext_utils.media_utils import get_md5_hash, get_media_info
+from ...ext_utils.media_utils import get_md5_hash, get_media_info, get_language_names
 from ...telegram_helper.message_utils import delete_message
 from ...ext_utils.hyperul_utils import HypertgUpload
 
@@ -47,6 +51,133 @@ async def _call_with_flood_retry(method, *args, **kwargs):
         except (FloodWait, FloodPremiumWait) as f:
             LOGGER.warning(f"FloodWait {f.value}s, retrying {method.__name__}")
             await sleep(f.value + 1)
+
+
+
+async def _apply_track_data_metadata(file_path, user_dict=None, track_data_enabled=True):
+    """Write player-visible audio titles. Detailed codec data is optional per user."""
+    if not file_path or not ospath.isfile(file_path):
+        return False
+    try:
+        # Probe stream metadata without loading the media into memory.
+        import asyncio
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_streams", "-of", "json", file_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            return False
+        streams = json.loads(out.decode("utf-8", "replace")).get("streams", [])
+        audio = [st for st in streams if st.get("codec_type") == "audio"]
+        if not audio:
+            return False
+
+        user_dict = user_dict if isinstance(user_dict, dict) else {}
+        # Only AUDIO_METADATA.title is an audio-track title. A generic
+        # METADATA/SET_ALL_METADATA title is handled by the video stream mapper
+        # and must never be appended to audio titles or language labels.
+        def configured_audio_title():
+            value = user_dict.get("AUDIO_METADATA")
+            if isinstance(value, str):
+                try:
+                    from ...ext_utils.metadata_utils import MetadataProcessor
+                    value = MetadataProcessor.parse_string(value)
+                except Exception:
+                    value = {}
+            if isinstance(value, dict):
+                for key, title in value.items():
+                    if str(key).strip().lower() == "title" and title is not None and str(title).strip():
+                        return str(title).strip()
+            return ""
+
+        custom_title = configured_audio_title()
+        codec_names = {
+            "eac3": "DD+", "ac3": "AC3", "aac": "AAC", "truehd": "TrueHD",
+            "dts": "DTS", "dts_hd": "DTS-HD", "opus": "Opus", "mp3": "MP3",
+            "flac": "FLAC", "alac": "ALAC", "pcm_s16le": "PCM",
+        }
+        titles = []
+        for st in audio:
+            tags = st.get("tags") or {}
+            raw_lang = str(tags.get("language") or tags.get("LANGUAGE") or "und").strip()
+            display_lang, _native_lang = get_language_names(raw_lang)
+            lang = display_lang or "Unknown"
+
+            existing_title = str(tags.get("title") or tags.get("TITLE") or "").strip()
+            # Prefer the already-applied stream title: metadata placeholders such
+            # as {audiolang} have been resolved there. The raw configured value
+            # is a fallback only, never suffixed with codec/language notes.
+            track_title = existing_title or custom_title
+            if custom_title:
+                titles.append(track_title[:180])
+                continue
+
+            # Disabled: preserve a title that is already on this audio stream,
+            # followed by its clean language label. No global video title.
+            if not track_data_enabled:
+                base_title = existing_title
+                parts = [base_title] if base_title else []
+                if lang != "Unknown" and lang.casefold() not in base_title.casefold():
+                    parts.append(lang)
+                title = " - ".join(parts) or (lang if lang != "Unknown" else "Audio")
+                titles.append(title[:180])
+                continue
+
+            codec = codec_names.get(str(st.get("codec_name", "")).lower(),
+                                    str(st.get("codec_name", "Audio")).upper())
+            layout = str(st.get("channel_layout") or "")
+            channels = st.get("channels")
+            if layout:
+                layout = layout.replace("stereo", "2.0").replace("mono", "1.0")
+                channel_text = layout
+            elif channels == 6:
+                channel_text = "5.1"
+            elif channels == 8:
+                channel_text = "7.1"
+            elif channels == 2:
+                channel_text = "2.0"
+            elif channels == 1:
+                channel_text = "1.0"
+            elif channels:
+                channel_text = f"{channels}ch"
+            else:
+                channel_text = ""
+            bitrate = st.get("bit_rate")
+            try:
+                bitrate_text = f"{max(1, round(int(bitrate) / 1000))}Kbps" if bitrate else ""
+            except (TypeError, ValueError):
+                bitrate_text = ""
+            detail = " ".join(x for x in (codec, channel_text) if x)
+            if bitrate_text:
+                detail = f"{detail} - {bitrate_text}" if detail else bitrate_text
+            title = f"{detail} [{lang}]" if lang != "Unknown" else detail
+            titles.append(title[:180] or (lang if lang != "Unknown" else "Audio"))
+
+        # Stream-copy remux: no re-encoding, so quality is unchanged. Keep original if unsupported.
+        ext = ospath.splitext(file_path)[1]
+        fd, temp_path = tempfile.mkstemp(prefix=".trackdata_", suffix=ext, dir=ospath.dirname(file_path) or ".")
+        os.close(fd)
+        try:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", file_path, "-map", "0", "-c", "copy"]
+            for idx, title in enumerate(titles):
+                cmd.extend([f"-metadata:s:a:{idx}", f"title={title}"])
+            cmd.append(temp_path)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, err = await proc.communicate()
+            if proc.returncode != 0 or not ospath.exists(temp_path) or ospath.getsize(temp_path) <= 0:
+                return False
+            os.replace(temp_path, file_path)
+            return True
+        finally:
+            if ospath.exists(temp_path):
+                with suppress(Exception):
+                    os.remove(temp_path)
+    except Exception as e:
+        LOGGER.warning(f"Could not apply track-data metadata to {file_path}: {e}")
+        return False
 
 
 class TelegramUploader:
@@ -66,6 +197,7 @@ class TelegramUploader:
         self._lsuffix = ""
         self._lcaption = ""
         self._lfont = ""
+        self._track_data_enabled = False
         self._bot_pm = False
         self._media_group = False
         self._is_private = False
@@ -85,14 +217,13 @@ class TelegramUploader:
             "LEECH_SUFFIX": ("_lsuffix", ""),
             "LEECH_CAPTION": ("_lcaption", ""),
             "LEECH_FONT": ("_lfont", ""),
+            "TRACK_DATA_ENABLE": ("_track_data_enabled", False),
         }
 
         for key, (attr, default) in settings_map.items():
-            setattr(
-                self,
-                attr,
-                self._listener.user_dict.get(key) or getattr(Config, key, default),
-            )
+            user_value = self._listener.user_dict.get(key)
+            value = getattr(Config, key, default) if user_value is None else user_value
+            setattr(self, attr, value)
 
         user_perm = self._listener.user_dict.get("THUMBNAIL") or f"thumbnails/{self._listener.user_id}.jpg"
         has_custom = await aiopath.exists(str(user_perm))
@@ -148,27 +279,66 @@ class TelegramUploader:
         # These are wzgram clients and are load-balanced by HypertgUpload.
         # Keep personal/user sessions isolated so their uploads are never
         # silently transferred through helper accounts.
-        if not getattr(self, "_hu_clients", None) and getattr(TgClient, "helper_bots", None):
+        if (
+            not getattr(self, "_hu_clients", None)
+            and getattr(Config, "USE_HYPER", True)
+            and getattr(TgClient, "helper_bots", None)
+        ):
             self._hu_clients = dict(TgClient.helper_bots)
-            LOGGER.info("HyperUP enabled with %d global helper client(s)", len(self._hu_clients))
+            LOGGER.info("HyperUP upload engine enabled with %d global helper client(s)", len(self._hu_clients))
 
     async def _msg_to_reply(self):
         from ...ext_utils.bot_utils import parse_dest
+
         if self._user_session and self._user_client is None:
             self._user_session = False
 
-        if getattr(self._listener, "has_preset_dump", False) and self._listener.key_dump_dests:
+        # Resolve one destination once and use it for the starter message and
+        # the HyperUP/direct upload. This prevents the upload engine from
+        # silently choosing a different chat than the task's selected dump.
+        target_thread_id = None
+        if self._listener.up_dest:
+            if isinstance(self._listener.up_dest, int):
+                target_chat_id = self._listener.up_dest
+                target_thread_id = getattr(self._listener, "chat_thread_id", None)
+            else:
+                target_chat_id, target_thread_id = parse_dest(self._listener.up_dest)
+                target_thread_id = target_thread_id or getattr(
+                    self._listener, "chat_thread_id", None
+                )
+        elif getattr(self._listener, "has_preset_dump", False) and self._listener.key_dump_dests:
             first_dump = self._listener.key_dump_dests[0]
-            target_chat_id, _ = parse_dest(first_dump) if not isinstance(first_dump, int) else (first_dump, None)
+            if isinstance(first_dump, int):
+                target_chat_id = first_dump
+            else:
+                target_chat_id, target_thread_id = parse_dest(first_dump)
         elif self._listener.leech_dest:
-            target_chat_id, _ = parse_dest(self._listener.leech_dest) if not isinstance(self._listener.leech_dest, int) else (self._listener.leech_dest, self._listener.leech_thread_id)
-        elif self._listener.up_dest:
-            target_chat_id, _ = parse_dest(self._listener.up_dest) if not isinstance(self._listener.up_dest, int) else (self._listener.up_dest, self._listener.chat_thread_id)
+            if isinstance(self._listener.leech_dest, int):
+                target_chat_id = self._listener.leech_dest
+                target_thread_id = getattr(self._listener, "leech_thread_id", None)
+            else:
+                target_chat_id, target_thread_id = parse_dest(self._listener.leech_dest)
+                target_thread_id = target_thread_id or getattr(
+                    self._listener, "leech_thread_id", None
+                )
         elif self._listener.user_dict.get("LEECH_DUMP_CHAT"):
             udump = self._listener.user_dict.get("LEECH_DUMP_CHAT")
-            target_chat_id, _ = parse_dest(udump) if not isinstance(udump, int) else (udump, None)
+            if isinstance(udump, int):
+                target_chat_id = udump
+            else:
+                target_chat_id, target_thread_id = parse_dest(udump)
         else:
             target_chat_id = self._listener.user_id
+
+        # Shared state makes HyperUP target exactly the chat in which this
+        # starter message is created, including the selected topic/thread.
+        self._listener._upload_chat_id = target_chat_id
+        self._listener._upload_thread_id = target_thread_id
+        sender_client = (
+            self._user_client
+            if self._user_session and self._user_client is not None
+            else self._listener.client
+        )
 
         if self._user_session:
             try:
@@ -179,36 +349,41 @@ class TelegramUploader:
                 )
             except Exception:
                 self._sent_msg = None
-            if self._sent_msg is None or self._sent_msg.chat is None:
-                try:
-                    self._sent_msg = await _call_with_flood_retry(
-                        self._user_client.send_message,
-                        chat_id=target_chat_id,
-                        text="Starting upload...",
-                        disable_web_page_preview=True,
-                        disable_notification=True,
-                    )
-                except Exception:
-                    self._sent_msg = self._listener.message
-            if self._sent_msg is None or self._sent_msg.chat is None:
-                self._sent_msg = self._listener.message
-            self._is_private = self._sent_msg.chat.type == ChatType.PRIVATE
-        else:
-            if target_chat_id == self._listener.message.chat.id:
-                self._sent_msg = self._listener.message
-            else:
-                try:
-                    self._sent_msg = await _call_with_flood_retry(
-                        self._user_client.send_message,
-                        chat_id=target_chat_id,
-                        text="Starting upload...",
-                        disable_web_page_preview=True,
-                        disable_notification=True,
-                    )
-                except Exception:
-                    self._sent_msg = self._listener.message
-            self._is_private = self._sent_msg.chat.type == ChatType.PRIVATE
 
+        else:
+            self._sent_msg = (
+                self._listener.message
+                if target_chat_id == self._listener.message.chat.id
+                else None
+            )
+
+        if self._sent_msg is None or getattr(self._sent_msg, "chat", None) is None:
+            try:
+                kwargs = {
+                    "chat_id": target_chat_id,
+                    "text": "Starting upload...",
+                    "disable_web_page_preview": True,
+                    "disable_notification": True,
+                }
+                if target_thread_id:
+                    kwargs["message_thread_id"] = target_thread_id
+                self._sent_msg = await _call_with_flood_retry(
+                    sender_client.send_message, **kwargs
+                )
+            except Exception as e:
+                LOGGER.warning(
+                    "Unable to create upload starter message in chat %s: %s",
+                    target_chat_id,
+                    e,
+                )
+                self._sent_msg = self._listener.message
+
+        if self._sent_msg is None or getattr(self._sent_msg, "chat", None) is None:
+            await self._listener.on_upload_error(
+                f"Unable to initialize upload target {target_chat_id}"
+            )
+            return False
+        self._is_private = self._sent_msg.chat.type == ChatType.PRIVATE
         return True
 
     async def _prepare_file(self, pre_file_, dirpath):
@@ -252,6 +427,11 @@ class TelegramUploader:
             else:
                 dur, qual, lang, subs = media_info_res[:4]
                 langr = lang
+            # Keep template placeholders predictable and ensure missing media metadata
+            # never leaves the caption formatter with undefined values.
+            lang = str(lang or "").strip()
+            langr = str(langr or lang or "").strip()
+            subs = str(subs or "").strip()
             cap_mono = parts[0].format(
                 filename=cap_file_,
                 size=get_readable_file_size(await aiopath.getsize(up_path)),
@@ -311,6 +491,14 @@ class TelegramUploader:
             except Exception as e:
                 LOGGER.warning(f"Failed to rename {old_path} to {new_path}: {e}")
                 new_path = old_path
+
+        # Always apply the user's display mode to incoming media: detailed track
+        # data when enabled, otherwise only configured/existing title + language.
+        await _apply_track_data_metadata(
+            new_path,
+            self._listener.user_dict,
+            track_data_enabled=self._track_data_enabled,
+        )
 
         return new_path, cap_mono
 
@@ -433,145 +621,133 @@ class TelegramUploader:
                     LOGGER.error(f"Failed To Send in BotPM:\n{err_msg}")
 
     async def _sequence_copies(self, src_chat):
-        from ...ext_utils.bot_utils import parse_dest
-        destinations = []
+        """Deliver each uploaded message to exactly one final destination.
 
-        # AUTHORIZED_CHATS is an access-control list, never an implicit upload
-        # destination. A chat is allowed here only when it is explicitly a
-        # configured dump destination; otherwise uploads fall back to the user DM.
-        raw_auth = str(getattr(Config, "AUTHORIZED_CHATS", "") or "")
+        A configured dump takes precedence. If no dump is configured (or its
+        copy fails), deliver once to the requesting user's DM. Do not fan out
+        to every configured dump and then also DM the same file.
+        """
+        from ...ext_utils.bot_utils import parse_dest
+
+        def parse_target(raw):
+            if not raw:
+                return None
+            try:
+                chat, thread = (
+                    parse_dest(raw)
+                    if not isinstance(raw, int)
+                    else (raw, None)
+                )
+                if isinstance(chat, str) and chat.lstrip("-").isdigit():
+                    chat = int(chat)
+                return (chat, thread) if chat else None
+            except Exception as err:
+                LOGGER.warning("Ignoring invalid leech dump destination %r: %s", raw, err)
+                return None
+
+        # A task-level -up destination is an explicit routing override.
+        # Delivering there is the whole operation: do not additionally fan out
+        # to preset/global dumps or the user's DM.
+        dump_target = None
+        preset_dests = getattr(self._listener, "key_dump_dests", None) or []
+        explicit_up = parse_target(getattr(self._listener, "up_dest", None))
+        if explicit_up and str(explicit_up[0]) != str(self._listener.user_id):
+            dump_target = explicit_up
+        else:
+            # Pick ONE configured dump deterministically when -up is absent.
+            if getattr(self._listener, "has_preset_dump", False):
+                for raw in preset_dests:
+                    dump_target = parse_target(raw)
+                    if dump_target:
+                        break
+
+            if dump_target is None:
+                for raw in (getattr(self._listener, "leech_dest", None),
+                            self._listener.user_dict.get("LEECH_DUMP_CHAT"),
+                            getattr(Config, "LEECH_LOG_CHAT", "")):
+                    candidate = parse_target(raw)
+                    if candidate and str(candidate[0]) != str(self._listener.user_id):
+                        dump_target = candidate
+                        break
+        if dump_target is None:
+            dump_chats = getattr(Config, "LEECH_DUMP_CHATS", {}) or {}
+            if isinstance(dump_chats, dict):
+                for raw in dump_chats.values():
+                    candidate = parse_target(raw)
+                    if candidate and str(candidate[0]) != str(self._listener.user_id):
+                        dump_target = candidate
+                        break
+
         auth_ids = set()
-        for raw in raw_auth.split():
+        for raw in str(getattr(Config, "AUTHORIZED_CHATS", "") or "").split():
             base = raw.split("|", 1)[0].strip()
             if base.lstrip("-").isdigit():
                 auth_ids.add(int(base))
-
-        allowed_dump_ids = set()
-        for raw_dump in [
-            self._listener.user_dict.get("LEECH_DUMP_CHAT"),
-            getattr(Config, "LEECH_LOG_CHAT", ""),
-        ]:
-            if raw_dump:
-                try:
-                    d_chat, _ = parse_dest(raw_dump) if not isinstance(raw_dump, int) else (raw_dump, None)
-                    if isinstance(d_chat, int):
-                        allowed_dump_ids.add(d_chat)
-                except Exception:
-                    pass
-        for raw_dump in (Config.LEECH_DUMP_CHATS or {}).values():
-            if raw_dump:
-                try:
-                    d_chat, _ = parse_dest(raw_dump) if not isinstance(raw_dump, int) else (raw_dump, None)
-                    if isinstance(d_chat, int):
-                        allowed_dump_ids.add(d_chat)
-                except Exception:
-                    pass
-
-        def add_dest(c_chat, c_thread):
-            if c_chat is None:
-                return
-            if isinstance(c_chat, str) and c_chat.lstrip("-").isdigit():
-                c_chat = int(c_chat)
-            try:
-                numeric_chat = int(c_chat) if str(c_chat).lstrip("-").isdigit() else None
-            except (TypeError, ValueError):
-                numeric_chat = None
-            if numeric_chat in auth_ids and numeric_chat not in allowed_dump_ids:
-                LOGGER.info("Skipping AUTHORIZED_CHATS upload target %s", numeric_chat)
-                return
-            if (c_chat, c_thread) not in destinations:
-                destinations.append((c_chat, c_thread))
-
-        has_preset = getattr(self._listener, "has_preset_dump", False) and bool(getattr(self._listener, "key_dump_dests", None))
-
-        if has_preset:
-            for k_dest in self._listener.key_dump_dests:
-                if k_dest:
-                    k_chat, k_thread = parse_dest(k_dest) if not isinstance(k_dest, int) else (k_dest, None)
-                    add_dest(k_chat, k_thread)
-        else:
-            leech_dest_found = False
-            if self._listener.leech_dest:
-                d_chat, d_thread = parse_dest(self._listener.leech_dest) if not isinstance(self._listener.leech_dest, int) else (self._listener.leech_dest, self._listener.leech_thread_id)
-                add_dest(d_chat, d_thread)
-                leech_dest_found = True
-
-            if self._listener.up_dest:
-                g_chat, g_thread = parse_dest(self._listener.up_dest) if not isinstance(self._listener.up_dest, int) else (self._listener.up_dest, self._listener.chat_thread_id)
-                add_dest(g_chat, g_thread)
-                leech_dest_found = True
-
-            user_dump = self._listener.user_dict.get("LEECH_DUMP_CHAT")
-            if user_dump:
-                u_chat, u_thread = parse_dest(user_dump) if not isinstance(user_dump, int) else (user_dump, None)
-                add_dest(u_chat, u_thread)
-                leech_dest_found = True
-
-            if not leech_dest_found:
-                add_dest(self._listener.user_id, None)
-
-        user_dump = self._listener.user_dict.get("LEECH_DUMP_CHAT")
-        if user_dump:
-            u_chat, u_thread = parse_dest(user_dump) if not isinstance(user_dump, int) else (user_dump, None)
-            add_dest(u_chat, u_thread)
-
-        if Config.LEECH_LOG_CHAT:
-            l_chat, l_thread = parse_dest(Config.LEECH_LOG_CHAT) if not isinstance(Config.LEECH_LOG_CHAT, int) else (Config.LEECH_LOG_CHAT, None)
-            add_dest(l_chat, l_thread)
-
-        if Config.LEECH_DUMP_CHATS and isinstance(Config.LEECH_DUMP_CHATS, dict):
-            for d_val in Config.LEECH_DUMP_CHATS.values():
-                if d_val:
-                    c_chat, c_thread = parse_dest(d_val) if not isinstance(d_val, int) else (d_val, None)
-                    add_dest(c_chat, c_thread)
+        if dump_target and isinstance(dump_target[0], int):
+            if dump_target[0] in auth_ids:
+                # Authorized chats are not valid destinations unless explicitly
+                # configured as a dump above.
+                explicitly_configured = any(
+                    parse_target(raw) == dump_target
+                    for raw in [self._listener.user_dict.get("LEECH_DUMP_CHAT"),
+                                getattr(Config, "LEECH_LOG_CHAT", "")]
+                    + list((getattr(Config, "LEECH_DUMP_CHATS", {}) or {}).values())
+                    + (preset_dests if getattr(self._listener, "has_preset_dump", False) else [])
+                )
+                if not explicitly_configured:
+                    dump_target = None
 
         for entry in self._upload_seq:
-            if entry is None:
+            if not entry or self._listener.is_cancelled:
                 continue
-            copy_from_chat = entry["chat_id"]
-            copy_from_msg = entry["msg_id"]
-            copied_to_user_dm = False
 
-            # A blocked/invalid configured destination must never prevent delivery
-            # to the requesting user. AUTHORIZED_CHATS is access control only;
-            # only explicitly configured dump chats are eligible destinations.
-            for dest_chat, thread_id in destinations:
-                if dest_chat == copy_from_chat:
-                    continue
-                try:
-                    kw = {}
-                    if thread_id:
-                        kw["message_thread_id"] = thread_id
-                    await _call_with_flood_retry(
-                        TgClient.bot.copy_message,
-                        chat_id=dest_chat,
-                        from_chat_id=copy_from_chat,
-                        message_id=copy_from_msg,
-                        **kw
-                    )
-                    if str(dest_chat) == str(self._listener.user_id):
-                        copied_to_user_dm = True
-                except Exception as err:
-                    if not self._listener.is_cancelled:
+            source_chat = entry["chat_id"]
+            source_msg = entry["msg_id"]
+            target = dump_target
+            delivered = False
+
+            if target:
+                dest_chat, thread_id = target
+                if str(dest_chat) == str(source_chat):
+                    # The media was uploaded directly into its final dump chat.
+                    delivered = True
+                else:
+                    try:
+                        kwargs = {"message_thread_id": thread_id} if thread_id else {}
+                        await _call_with_flood_retry(
+                            TgClient.bot.copy_message,
+                            chat_id=dest_chat,
+                            from_chat_id=source_chat,
+                            message_id=source_msg,
+                            **kwargs,
+                        )
+                        delivered = True
+                    except Exception as err:
                         LOGGER.error(
-                            f"Failed to copy output message to dump destination {dest_chat}: {err}"
+                            "Failed to deliver %s to dump %s; falling back to user DM once: %s",
+                            entry.get("file_"), dest_chat, err,
                         )
 
-            # Always provide a DM fallback when no dump destination worked.
-            if not copied_to_user_dm and not self._listener.is_cancelled:
+            if (
+                not delivered
+                and not self._listener.is_cancelled
+                and not (explicit_up and str(explicit_up[0]) != str(self._listener.user_id))
+            ):
                 try:
-                    await _call_with_flood_retry(
-                        TgClient.bot.copy_message,
-                        chat_id=self._listener.user_id,
-                        from_chat_id=copy_from_chat,
-                        message_id=copy_from_msg,
-                    )
+                    if str(source_chat) == str(self._listener.user_id):
+                        delivered = True
+                    else:
+                        await _call_with_flood_retry(
+                            TgClient.bot.copy_message,
+                            chat_id=self._listener.user_id,
+                            from_chat_id=source_chat,
+                            message_id=source_msg,
+                        )
+                        delivered = True
                 except Exception as err:
                     LOGGER.error(
-                        "Could not deliver output to user DM %s. "
-                        "The user may need to start the bot: %s",
-                        self._listener.user_id,
-                        err,
+                        "Could not deliver output to user DM %s: %s",
+                        self._listener.user_id, err,
                     )
 
     async def _upload_file_task(self, file_, f_path, dirpath, user_session, seq_idx):

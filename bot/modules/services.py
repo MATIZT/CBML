@@ -86,6 +86,12 @@ async def start(_, message):
     user_name = message.from_user.first_name if message.from_user else "User"
     reply_markup = await _build_start_buttons()
 
+    # Deep link used by the API manager's group-to-DM button. Accept the
+    # plain payload and future api_* payloads, and always open the manager in DM.
+    if len(message.command) > 1 and message.command[1].split("_", 1)[0].lower() == "api":
+        from .api_manager import api_command
+        return await api_command(_, message)
+
     if len(message.command) > 1 and message.command[1] in ("wzmlx", "htrx"):
         await delete_message(message)
     elif len(message.command) > 1 and message.command[1] != "start":

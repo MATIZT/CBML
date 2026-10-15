@@ -45,6 +45,7 @@ class Config:
     DISABLE_SEARCH = False
     DISABLE_STREAM = False
     DISABLE_YTDLP = False
+    DISABLE_VIDTOOLS = []
     ENABLE_ENCODE = False
     ENABLE_COMPRESS = False
     ENABLE_WATERMARK = False
@@ -85,9 +86,9 @@ class Config:
     FILESTREAMS_UPLOAD_URL = ""
     FILESTREAMS_API_KEY = ""
     GDRIVE_ID = ""
-    GD_DESP = "Uploaded with WZ Bot"
-    AUTHOR_NAME = "HTR-X"
-    AUTHOR_URL = "https://t.me/HTR_X"
+    GD_DESP = "Uploaded with CANTARELLABOTS"
+    AUTHOR_NAME = "cantarellabots"
+    AUTHOR_URL = "https://t.me/cantarellabots"
     INSTADL_API = ""
     IMDB_TEMPLATE = ""
     IMAGES = []
@@ -148,7 +149,7 @@ class Config:
     HYDRA_API_KEY = ""
     NAME_SWAP = ""
     OWNER_ID = 0
-    PROGRESS_BAR = "■□"
+    PROGRESS_BAR = "▰▱"
     QUEUE_ALL = 0
     QUEUE_DOWNLOAD = 0
     QUEUE_UPLOAD = 0
@@ -228,6 +229,13 @@ class Config:
 
     @classmethod
     def load_config(cls):
+        # Heroku must be configured exclusively through Config Vars. Never load
+        # local config.py values in a dyno, even if a developer accidentally
+        # includes that file in a deployment checkout. Config Vars are applied
+        # afterward by load_env(); this guard prevents stale/embedded secrets
+        # and old values from silently becoming runtime defaults on Heroku.
+        if getenv("DYNO") or getenv("HEROKU_APP_NAME"):
+            return
         try:
             settings = import_module("config")
         except ModuleNotFoundError:
@@ -262,12 +270,6 @@ class Config:
                 if isinstance(legacy_value, str):
                     legacy_value = legacy_value.strip()
                 cls.LEECH_LOG_CHAT = legacy_value
-        for key in ["BOT_TOKEN", "OWNER_ID", "TELEGRAM_API", "TELEGRAM_HASH"]:
-            value = getattr(cls, key)
-            if isinstance(value, str):
-                value = value.strip()
-            if not value:
-                raise ValueError(f"{key} variable is missing!")
 
     @classmethod
     def load_env(cls):
@@ -282,6 +284,13 @@ class Config:
             if env_value is not None:
                 converted_value = cls._convert_env_type(key, env_value)
                 cls.set(key, converted_value)
+        # Validate required settings only after environment variables have been applied.
+        for key in ["BOT_TOKEN", "OWNER_ID", "TELEGRAM_API", "TELEGRAM_HASH"]:
+            value = getattr(cls, key)
+            if isinstance(value, str):
+                value = value.strip()
+            if not value:
+                raise ValueError(f"{key} variable is missing!")
 
     @classmethod
     def _convert_env_type(cls, key, value):
